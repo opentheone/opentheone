@@ -76,9 +76,14 @@ type WeChatBinding struct {
 	TypingTicket     string    `gorm:"type:text" json:"-"`
 	TypingTicketAt   time.Time `json:"-"`
 	QRCodeToken      string    `gorm:"size:128" json:"-"`
-	QRCodeImageURL   string    `gorm:"size:255" json:"qrcode_image_url"`
-	ScanPhase        string    `gorm:"size:16" json:"scan_phase"` // wait / scanned / confirmed / expired
-	LastProactiveAt  time.Time `json:"last_proactive_at"`
+	// QRCodeImageURL is misnamed for historical reasons: it stores the URL that
+	// should be **encoded into** a QR code (i.e. what a scanning WeChat client
+	// will decode), NOT a URL that points to an image. The handler layer is
+	// responsible for rendering it into a PNG / data-URI before shipping it
+	// to the frontend. See handler/binding.go::renderQRDataURI.
+	QRCodeImageURL  string    `gorm:"size:255" json:"-"`
+	ScanPhase       string    `gorm:"size:16" json:"scan_phase"` // wait / scanned / confirmed / expired
+	LastProactiveAt time.Time `json:"last_proactive_at"`
 }
 
 // Conversation represents a chat thread between a binding and a remote WeChat user.

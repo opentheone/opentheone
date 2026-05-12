@@ -1,15 +1,40 @@
 package handler
 
 import (
+	"encoding/base64"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	qrcode "github.com/skip2/go-qrcode"
+	"go.uber.org/zap"
 	"gorm.io/gorm"
 
 	"github.com/wzyjerry/opentheone/backend/internal/model"
 	"github.com/wzyjerry/opentheone/backend/internal/runner"
 )
+
+// renderQRDataURI takes the URL that iLink returns in `qrcode_img_content`
+// (despite the field name, the API actually returns a redirect URL that should
+// be ENCODED INTO a QR — not a URL pointing to an image) and produces a
+// base64-encoded PNG data URI suitable for direct use in <img src="…">.
+//
+// Returns "" if rendering fails so the frontend can fall back to a "click
+// here" link or a re-fetch button instead of showing a broken image.
+//
+// Size 256 chosen empirically: large enough that a 1080p WeChat scanner sees
+// crisp modules, small enough that the data URI stays well under 16 KB.
+func renderQRDataURI(content string) string {
+	if content == "" {
+		return ""
+	}
+	png, err := qrcode.Encode(content, qrcode.Medium, 256)
+	if err != nil {
+		zap.L().Warn("qr render failed", zap.Error(err))
+		return ""
+	}
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(png)
+}
 
 type BindingHandler struct {
 	db    *gorm.DB
@@ -51,7 +76,7 @@ func (h *BindingHandler) Start(c *gin.Context) {
 	ok(c, gin.H{
 		"binding_id":       binding.ID,
 		"qrcode_token":     binding.QRCodeToken,
-		"qrcode_image_url": binding.QRCodeImageURL,
+		"qrcode_image_url": renderQRDataURI(binding.QRCodeImageURL),
 		"state":            binding.State,
 	})
 }
@@ -76,7 +101,7 @@ func (h *BindingHandler) Status(c *gin.Context) {
 		"binding_id":       b.ID,
 		"state":            b.State,
 		"phase":            phaseOf(&b),
-		"qrcode_image_url": b.QRCodeImageURL,
+		"qrcode_image_url": renderQRDataURI(b.QRCodeImageURL),
 		"ilink_bot_id":     b.ILinkBotID,
 		"ilink_user_id":    b.ILinkUserID,
 		"persona_id":       b.PersonaID,
@@ -128,7 +153,7 @@ func (h *BindingHandler) ForPersona(c *gin.Context) {
 			"binding_id":       b.ID,
 			"state":            b.State,
 			"phase":            phaseOf(&b),
-			"qrcode_image_url": b.QRCodeImageURL,
+			"qrcode_image_url": renderQRDataURI(b.QRCodeImageURL),
 			"ilink_bot_id":     b.ILinkBotID,
 			"ilink_user_id":    b.ILinkUserID,
 			"persona_id":       b.PersonaID,
@@ -169,6 +194,11 @@ func (h *BindingHandler) Revoke(c *gin.Context) {
 		return
 	}
 	h.mgr.Stop(b.ID)
+	// NOTE: these keys are *physical column names*, not API field names.
+	// GORM's default NamingStrategy converts CamelCase to snake_case with
+	// per-word splits, so QRCodeImageURL becomes `qr_code_image_url`
+	// (not `qrcode_image_url`). Keep this in sync with the actual schema —
+	// `sqlite3 data/oto.db ".schema we_chat_bindings"` is the source of truth.
 	if err := h.db.Model(&b).Updates(map[string]interface{}{
 		"state":              "revoked",
 		"bot_token":          "",
@@ -176,8 +206,8 @@ func (h *BindingHandler) Revoke(c *gin.Context) {
 		"typing_ticket":      "",
 		"last_context_token": "",
 		"last_proactive_at":  time.Time{},
-		"qrcode_token":       "",
-		"qrcode_image_url":   "",
+		"qr_code_token":      "",
+		"qr_code_image_url":  "",
 		"scan_phase":         "",
 	}).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 500, err.Error())

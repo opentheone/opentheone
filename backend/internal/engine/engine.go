@@ -79,8 +79,12 @@ func NewEngine(db *gorm.DB, ilinkClient *ilink.Client, mem *memory.Service, log 
 // upsertConversation finds-or-creates a conversation row and refreshes last_message_at.
 func (e *Engine) upsertConversation(ctx context.Context, bindingID, peerID, sessionID string) (*model.Conversation, error) {
 	var conv model.Conversation
+	// NOTE: physical column is `i_link_user_id`, NOT `ilink_user_id`.
+	// GORM's NamingStrategy splits CamelCase at every transition, so the
+	// Go field `ILinkUserID` becomes `i_link_user_id` in SQL. Verify with
+	// `sqlite3 data/oto.db ".schema conversations"`.
 	err := e.db.WithContext(ctx).
-		Where("binding_id = ? AND ilink_user_id = ?", bindingID, peerID).
+		Where("binding_id = ? AND i_link_user_id = ?", bindingID, peerID).
 		First(&conv).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		conv = model.Conversation{
@@ -532,7 +536,7 @@ func (e *Engine) SendLiteralText(ctx context.Context, binding *model.WeChatBindi
 	var conv model.Conversation
 	if peerUserID != "" {
 		if err := e.db.WithContext(ctx).
-			Where("binding_id = ? AND ilink_user_id = ?", binding.ID, peerUserID).
+			Where("binding_id = ? AND i_link_user_id = ?", binding.ID, peerUserID).
 			First(&conv).Error; err != nil {
 			return fmt.Errorf("conversation not found for peer: %w", err)
 		}
@@ -590,7 +594,7 @@ func (e *Engine) SendProactive(ctx context.Context, binding *model.WeChatBinding
 	var conv model.Conversation
 	if peerUserID != "" {
 		if err := e.db.WithContext(ctx).
-			Where("binding_id = ? AND ilink_user_id = ?", binding.ID, peerUserID).
+			Where("binding_id = ? AND i_link_user_id = ?", binding.ID, peerUserID).
 			First(&conv).Error; err != nil {
 			return fmt.Errorf("conversation not found for peer: %w", err)
 		}

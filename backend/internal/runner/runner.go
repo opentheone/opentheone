@@ -78,24 +78,97 @@ func (m *Manager) Start(b *model.WeChatBinding) error {
 	return nil
 }
 
-// Stop terminates the runner.
+// Stop terminates the runner and best-effort announces shutdown to the
+// upstream server via /ilink/bot/msg/notifystop so it can release long-poll
+// state. The notification is sent on a fresh detached context so the
+// already-canceled runner ctx doesn't immediately abort it.
 func (m *Manager) Stop(bindingID string) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if r, ok := m.runners[bindingID]; ok {
+	r, ok := m.runners[bindingID]
+	if ok {
 		r.cancel()
 		delete(m.runners, bindingID)
 	}
+	m.mu.Unlock()
+	if ok {
+		m.notifyStopAsync(bindingID)
+	}
 }
 
-// StopAll waits for every runner to exit.
+// StopAll cancels every runner and best-effort fires notifyStop in parallel.
+// Returns once the notifyStop calls have either succeeded, errored, or
+// timed out — bounded to ~10s overall so process shutdown isn't blocked.
 func (m *Manager) StopAll() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, r := range m.runners {
+	ids := make([]string, 0, len(m.runners))
+	for id, r := range m.runners {
 		r.cancel()
+		ids = append(ids, id)
 	}
 	m.runners = map[string]*bindingRunner{}
+	m.mu.Unlock()
+
+	if len(ids) == 0 {
+		return
+	}
+	done := make(chan struct{}, len(ids))
+	for _, id := range ids {
+		go func(bindingID string) {
+			defer func() {
+				_ = recover()
+				done <- struct{}{}
+			}()
+			m.notifyStopSync(bindingID)
+		}(id)
+	}
+	timeout := time.After(10 * time.Second)
+	for range ids {
+		select {
+		case <-done:
+		case <-timeout:
+			return
+		}
+	}
+}
+
+// notifyStopAsync issues a best-effort notifyStop for a single binding from
+// a fresh goroutine. Used by Stop, where we don't want to block the caller.
+func (m *Manager) notifyStopAsync(bindingID string) {
+	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				m.log.Warn("notifyStop goroutine panic recovered",
+					zap.String("binding_id", bindingID),
+					zap.Any("panic", rec))
+			}
+		}()
+		m.notifyStopSync(bindingID)
+	}()
+}
+
+// notifyStopSync sends a single notifyStop for the given binding using a
+// fresh 8s context detached from the (canceled) runner ctx.
+func (m *Manager) notifyStopSync(bindingID string) {
+	var b model.WeChatBinding
+	if err := m.db.Where("id = ?", bindingID).First(&b).Error; err != nil {
+		return
+	}
+	if b.BotToken == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	sess := ilink.Session{
+		BotToken:    b.BotToken,
+		BaseURL:     b.BaseURL,
+		ILinkBotID:  b.ILinkBotID,
+		ILinkUserID: b.ILinkUserID,
+	}
+	if _, err := m.ilink.NotifyStop(ctx, sess); err != nil {
+		m.log.Debug("notifyStop failed (ignored)",
+			zap.String("binding_id", bindingID),
+			zap.Error(err))
+	}
 }
 
 // bindingRunner is the per-binding long-poll loop.
@@ -105,11 +178,32 @@ type bindingRunner struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	log       *zap.Logger
+
+	// nextLongPollMS is the client-side timeout to use on the next getupdates
+	// call (in ms). The server's `longpolling_timeout_ms` response field is
+	// authoritative; we initialize to the configured default and update it
+	// whenever the server tells us a different window. Matches the
+	// `nextTimeoutMs` variable in monitorWeixinProvider.
+	nextLongPollMS int
+
+	// notifyStartDone tracks whether we have successfully announced this
+	// runner to the server via /ilink/bot/msg/notifystart. Failures are
+	// retried on the next loop iteration; once it succeeds we never call it
+	// again for the lifetime of this runner.
+	notifyStartDone bool
 }
 
 func (r *bindingRunner) loop() {
 	r.log.Info("runner started")
 	defer r.log.Info("runner stopped")
+
+	if r.nextLongPollMS <= 0 {
+		if d := r.mgr.ilink.LongPollTimeout; d > 0 {
+			r.nextLongPollMS = int(d / time.Millisecond)
+		} else {
+			r.nextLongPollMS = 35000
+		}
+	}
 
 	consecutiveFailures := 0
 
@@ -127,6 +221,38 @@ func (r *bindingRunner) loop() {
 			return
 		}
 	}
+}
+
+// announceStart fires /ilink/bot/msg/notifystart for the current binding the
+// first time the runner observes the binding is active. Best-effort: the
+// official client treats failures here as ignorable, but skipping it has
+// been observed to leave the session in a state where the server never
+// pushes inbound messages.
+func (r *bindingRunner) announceStart(binding *model.WeChatBinding) {
+	if r.notifyStartDone {
+		return
+	}
+	sess := ilink.Session{
+		BotToken:    binding.BotToken,
+		BaseURL:     binding.BaseURL,
+		ILinkBotID:  binding.ILinkBotID,
+		ILinkUserID: binding.ILinkUserID,
+	}
+	ctx, cancel := context.WithTimeout(r.ctx, 10*time.Second)
+	defer cancel()
+	resp, err := r.mgr.ilink.NotifyStart(ctx, sess)
+	if err != nil {
+		r.log.Warn("notifystart failed (ignored)", zap.Error(err))
+		return
+	}
+	if resp.Ret != 0 {
+		r.log.Warn("notifystart non-zero ret (ignored)",
+			zap.Int("ret", resp.Ret),
+			zap.String("errmsg", resp.ErrMsg))
+	} else {
+		r.log.Info("notifystart ok")
+	}
+	r.notifyStartDone = true
 }
 
 // iterateOnce performs exactly one getupdates round-trip plus message
@@ -155,6 +281,11 @@ func (r *bindingRunner) iterateOnce(consecutiveFailures *int) (stop bool) {
 		return true
 	}
 
+	// Best-effort: announce this client before the first long-poll. The
+	// official gateway does this in startAccount; failure is ignored but
+	// skipping it entirely has been seen to silently mute inbound delivery.
+	r.announceStart(&binding)
+
 	sess := ilink.Session{
 		BotToken:    binding.BotToken,
 		BaseURL:     binding.BaseURL,
@@ -162,7 +293,18 @@ func (r *bindingRunner) iterateOnce(consecutiveFailures *int) (stop bool) {
 		ILinkUserID: binding.ILinkUserID,
 	}
 
-	callCtx, cancelCall := context.WithTimeout(r.ctx, 45*time.Second)
+	// Per-call deadline: long-poll budget plus a small buffer for TCP
+	// teardown. This is intentionally larger than the server-side timeout
+	// (advertised via longpolling_timeout_ms in each response) so a normal
+	// idle poll doesn't look like a client-side abort.
+	timeoutMS := r.nextLongPollMS
+	if timeoutMS < 5000 {
+		timeoutMS = 5000
+	}
+	callCtx, cancelCall := context.WithTimeout(r.ctx, time.Duration(timeoutMS)*time.Millisecond+5*time.Second)
+	r.log.Debug("getupdates start",
+		zap.Int("timeout_ms", timeoutMS),
+		zap.Int("buf_len", len(binding.GetUpdatesBuf)))
 	resp, err := r.mgr.ilink.GetUpdates(callCtx, sess, binding.GetUpdatesBuf)
 	cancelCall()
 
@@ -176,8 +318,16 @@ func (r *bindingRunner) iterateOnce(consecutiveFailures *int) (stop bool) {
 		return false
 	}
 
+	// Adopt the server's preferred long-poll window for next iteration.
+	if resp.LongPollingTimeoutMS > 0 {
+		r.nextLongPollMS = resp.LongPollingTimeoutMS
+	}
+
 	if ilink.IsSessionExpired(resp.Ret, resp.ErrCode) {
-		r.log.Warn("session expired, marking binding")
+		r.log.Warn("session expired, marking binding",
+			zap.Int("ret", resp.Ret),
+			zap.Int("errcode", resp.ErrCode),
+			zap.String("errmsg", resp.ErrMsg))
 		_ = r.mgr.db.Model(&model.WeChatBinding{}).
 			Where("id = ?", r.bindingID).
 			Updates(map[string]interface{}{
@@ -189,17 +339,26 @@ func (r *bindingRunner) iterateOnce(consecutiveFailures *int) (stop bool) {
 		return true
 	}
 
-	if resp.Ret != 0 {
+	// Match the official client: ANY non-zero ret OR non-zero errcode is a
+	// protocol-level failure. Treating only ret would silently drop calls
+	// where the server signaled via errcode alone.
+	if resp.Ret != 0 || resp.ErrCode != 0 {
 		*consecutiveFailures++
-		r.log.Warn("getupdates non-zero ret",
+		r.log.Warn("getupdates non-zero status",
 			zap.Int("ret", resp.Ret),
 			zap.Int("errcode", resp.ErrCode),
-			zap.String("errmsg", resp.ErrMsg))
+			zap.String("errmsg", resp.ErrMsg),
+			zap.Int("fails", *consecutiveFailures))
 		r.backoff(*consecutiveFailures)
 		return false
 	}
 
 	*consecutiveFailures = 0
+
+	r.log.Debug("getupdates ok",
+		zap.Int("msg_count", len(resp.Msgs)),
+		zap.Int("next_long_poll_ms", r.nextLongPollMS),
+		zap.Int("new_buf_len", len(resp.GetUpdatesBuf)))
 
 	if resp.GetUpdatesBuf != "" && resp.GetUpdatesBuf != binding.GetUpdatesBuf {
 		_ = r.mgr.db.Model(&model.WeChatBinding{}).
@@ -209,12 +368,27 @@ func (r *bindingRunner) iterateOnce(consecutiveFailures *int) (stop bool) {
 
 	for i := range resp.Msgs {
 		msg := resp.Msgs[i]
+		// Skip our own echoed bot messages — but DO NOT filter by
+		// message_state. The protocol marks the field optional and several
+		// inbound user messages have been observed without it; Go's zero
+		// value would otherwise equal MessageStateNew and the message would
+		// be dropped on the floor. Mirrors monitorWeixinProvider, which
+		// forwards every message verbatim to processOneMessage.
 		if msg.MessageType == ilink.MessageTypeBot {
+			r.log.Debug("skip bot echo",
+				zap.Int64("ilink_message_id", msg.MessageID))
 			continue
 		}
-		if msg.MessageState == ilink.MessageStateGenerating || msg.MessageState == ilink.MessageStateNew {
+		// GENERATING is a transient intermediate state for streaming bot
+		// replies; we never want to react to a half-finished message.
+		if msg.MessageState == ilink.MessageStateGenerating {
 			continue
 		}
+		r.log.Debug("dispatch inbound",
+			zap.Int64("ilink_message_id", msg.MessageID),
+			zap.String("from", msg.FromUserID),
+			zap.Int("state", msg.MessageState),
+			zap.Int("items", len(msg.ItemList)))
 		r.safeHandleMessage(&binding, msg)
 	}
 	return false

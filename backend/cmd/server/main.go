@@ -102,6 +102,7 @@ func main() {
 		UserAgent:       cfg.ILink.UserAgent,
 		SKRouteTag:      cfg.ILink.SKRouteTag,
 		LongPollTimeout: time.Duration(cfg.ILink.LongPollTimeout) * time.Millisecond,
+		AppID:           cfg.ILink.AppID,
 	})
 
 	memSvc := memory.NewService(db)

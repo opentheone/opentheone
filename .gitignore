@@ -57,3 +57,7 @@ frontend/dist/
 # ignore everything else.
 backend/internal/web/dist/*
 !backend/internal/web/dist/index.html
+data/secret.key
+data/oto.db-wal
+data/oto.db-shm
+data/oto.db

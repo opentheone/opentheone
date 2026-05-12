@@ -460,29 +460,66 @@ iLink CDN 拉加密 blob → AES-128-ECB 解密 → 落盘到
 
 ### 7.1 用了哪些接口
 
-| 接口 | 用途 |
-|---|---|
-| `get_qrcode` | 申请扫码登录二维码 |
-| `get_qrcode_status` | 长轮询扫码状态（`wait` → `scanned` → `confirmed`） |
-| `get_updates` | 长轮询接收消息 |
-| `sendmessage` | 发送文本（带 `context_token`） |
-| `sendtyping` | 触发"对方正在输入" |
-| `get_typing_ticket` | 获取 typing 的临时票据 |
+| 接口 | 路径 | 用途 |
+|---|---|---|
+| `get_bot_qrcode` | `GET /ilink/bot/get_bot_qrcode?bot_type=3` | 申请扫码登录二维码 |
+| `get_qrcode_status` | `GET /ilink/bot/get_qrcode_status?qrcode=…` | 长轮询扫码状态（`wait` → `scaned` → `confirmed`） |
+| `notifystart` | `POST /ilink/bot/msg/notifystart` | 通告"这个 bot 现在上线了"，下一步进入长轮询前**必须**做（best-effort） |
+| `getupdates` | `POST /ilink/bot/getupdates` | 长轮询接收消息 |
+| `sendmessage` | `POST /ilink/bot/sendmessage` | 发送文本（带 `context_token`） |
+| `getconfig` | `POST /ilink/bot/getconfig` | 获取 typing 的临时票据 |
+| `sendtyping` | `POST /ilink/bot/sendtyping` | 触发"对方正在输入" |
+| `notifystop` | `POST /ilink/bot/msg/notifystop` | 下线前通告服务器释放长轮询槽位（best-effort） |
 
-### 7.2 关键细节
+### 7.2 通用请求头
+
+所有请求（GET 含 QR 端点、POST 含业务端点）都带：
+
+| Header | 值 | 备注 |
+|---|---|---|
+| `iLink-App-Id` | `bot` | 来自官方插件 `package.json#ilink_appid`；缺它部分服务端实例**不会下发消息** |
+| `iLink-App-ClientVersion` | 整数字符串，例如 `65536` | `((major&0xff)<<16)\|((minor&0xff)<<8)\|(patch&0xff)`，从 `ilink.channel_version` 推导 |
+| `SKRouteTag` | 可选 | 部署方自定义路由标签 |
+| `User-Agent` | `opentheone/0.1` | 仅用于观测 |
+
+业务 POST 额外带：
+
+| Header | 值 | 备注 |
+|---|---|---|
+| `Content-Type` | `application/json` |  |
+| `AuthorizationType` | `ilink_bot_token` | 固定值 |
+| `Authorization` | `Bearer <bot_token>` | 扫码确认后返回 |
+| `X-WECHAT-UIN` | `base64(<random uint32 as decimal string>)` | 每次请求重新随机 |
+
+### 7.3 关键细节
 
 - **`context_token`**：每条入站消息携带，**回复必须带上原 token**，否则
   消息不会被路由给对的会话。我们把它存到 `conversations.last_context_token`
   以及 `messages.context_token`。
+- **`get_updates_buf` 不透明游标**：服务器返回什么我们就原样回传，绝不解析。
+  首次请求传空字符串；扫码重登 / `errcode == -14` 后清空。
+- **`message_state` 取舍**：协议允许该字段缺省。我们**只过滤** `GENERATING (1)`
+  这种半成品流式中间态，不过滤 `NEW (0)`——后者实际上经常是「未设置」的零值，
+  把它一并丢弃曾导致整段会话"收不到消息"。
+- **`message_type` 过滤**：服务器有时会把我们自己发出的 BOT 消息（`type=2`）
+  回放在 `msgs` 里，长轮询里跳过这种 echo，避免自己回复自己。
+- **错误判定**：`ret != 0` **或** `errcode != 0` 都视为失败；只看 `ret` 会漏。
+  `ret == -14` 或 `errcode == -14` 是 session timeout，立刻清凭证并提示重新扫码。
+- **`longpolling_timeout_ms`**：服务器每次响应都附带"下次建议的长轮询窗口"，
+  我们采纳作为下次 `getupdates` 的客户端 deadline。
 - **`client_id` 幂等键**：出站消息生成 UUID 作 client_id；iLink 用它去
   重，避免网络抖动重发产生重复消息。
+- **`from_user_id` 显式空串**：出站 `sendmessage` 在 `msg.from_user_id` 上
+  **显式写空串**（不使用 Go `omitempty`），匹配官方插件——观察到某些部署在
+  字段缺失时会拒收。
 - **媒体加密**：CDN 返回的图片/语音/文件是 **AES-128-ECB**，密钥从消息的
-  `aes_key` 字段 base64 解出。我们解密后直接落盘到 `attachments_dir`，
-  原文 URL 也保留在 `media_url` 备查。下载限制 50MB 上限。
+  `aes_key` 字段 base64 解出（兼容 raw-16-bytes 和 hex-string 两种格式）。
+  我们解密后直接落盘到 `attachments_dir`，原文 URL 也保留在 `media_url` 备查。
+  下载限制 50MB 上限。
 - **revoke**：解绑只是把 `state` 改成 `revoked` + 清 `last_context_token`，
-  老 binding 行保留以便事后审计。
+  老 binding 行保留以便事后审计。同时尽力发一次 `notifystop`。
 
-### 7.3 我们**不**做的事
+### 7.4 我们**不**做的事
 
 - 不做协议逆向 / 不伪造客户端协议字段。
 - 不绕过 iLink 平台的速率 / 反作弊。

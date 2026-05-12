@@ -76,10 +76,14 @@ func (c *QRLoginCoordinator) StartScan(ctx context.Context, userID, personaID st
 		return nil, err
 	} else {
 		c.mgr.Stop(binding.ID)
+		// NOTE: map keys are *physical column names* (snake_case as produced by
+		// GORM's NamingStrategy on the Go field names), NOT the JSON tags.
+		// QRCodeImageURL -> qr_code_image_url; QRCodeToken -> qr_code_token.
+		// Verify with `sqlite3 data/oto.db ".schema we_chat_bindings"`.
 		updates := map[string]interface{}{
 			"state":              "pending_scan",
-			"qrcode_token":       qr.QRCode,
-			"qrcode_image_url":   qr.QRCodeImageURL,
+			"qr_code_token":      qr.QRCode,
+			"qr_code_image_url":  qr.QRCodeImageURL,
 			"scan_phase":         ilink.QRStatusWait,
 			"bot_token":          "",
 			"get_updates_buf":    "",
@@ -171,13 +175,17 @@ func (c *QRLoginCoordinator) pollScan(bindingID, qrToken string) {
 			if baseURL == "" {
 				baseURL = c.ilink.BaseURL
 			}
+			// NOTE: map keys are *physical column names*. ILinkBotID becomes
+			// `i_link_bot_id` (GORM splits at every CamelCase boundary) — the
+			// JSON-friendly `ilink_bot_id` is a separate concern handled in
+			// handler responses.
 			updates := map[string]interface{}{
-				"state":         "active",
-				"scan_phase":    ilink.QRStatusConfirmed,
-				"bot_token":     status.BotToken,
-				"base_url":      baseURL,
-				"ilink_bot_id":  status.ILinkBotID,
-				"ilink_user_id": status.ILinkUserID,
+				"state":          "active",
+				"scan_phase":     ilink.QRStatusConfirmed,
+				"bot_token":      status.BotToken,
+				"base_url":       baseURL,
+				"i_link_bot_id":  status.ILinkBotID,
+				"i_link_user_id": status.ILinkUserID,
 			}
 			if err := c.db.Model(&model.WeChatBinding{}).
 				Where("id = ?", bindingID).

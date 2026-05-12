@@ -32,6 +32,12 @@ type ILinkConfig struct {
 	LongPollTimeout int    `mapstructure:"long_poll_timeout_ms"`
 	UserAgent       string `mapstructure:"user_agent"`
 	SKRouteTag      string `mapstructure:"sk_route_tag"`
+	// AppID maps to the `iLink-App-Id` HTTP header attached to every iLink
+	// request. The official @tencent-weixin/openclaw-weixin v2.4.3 sources
+	// this from `package.json#ilink_appid`, where it is hardcoded to `"bot"`.
+	// Override only if you are pointing this client at a different
+	// deployment that expects a different app identity.
+	AppID string `mapstructure:"app_id"`
 }
 
 type StorageConfig struct {
@@ -69,6 +75,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("ilink.channel_version", "1.0.0")
 	v.SetDefault("ilink.long_poll_timeout_ms", 35000)
 	v.SetDefault("ilink.user_agent", "opentheone/0.1")
+	v.SetDefault("ilink.app_id", "bot")
 
 	v.SetDefault("storage.data_dir", "data")
 	v.SetDefault("storage.attachments_dir", "data/attachments")

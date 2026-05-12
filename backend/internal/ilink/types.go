@@ -114,9 +114,15 @@ type MessageItem struct {
 }
 
 type WeixinMessage struct {
-	Seq          int64         `json:"seq,omitempty"`
-	MessageID    int64         `json:"message_id,omitempty"`
-	FromUserID   string        `json:"from_user_id,omitempty"`
+	Seq       int64 `json:"seq,omitempty"`
+	MessageID int64 `json:"message_id,omitempty"`
+	// FromUserID is sent as the empty string on outbound sendmessage
+	// (matching the official @tencent-weixin/openclaw-weixin client). Inbound
+	// messages parsed off the wire fill it with the real WeChat user id;
+	// `omitempty` is deliberately absent so an outbound empty value still
+	// emits `"from_user_id": ""` on the wire — some server-side deployments
+	// reject the request entirely when the key is missing.
+	FromUserID   string        `json:"from_user_id"`
 	ToUserID     string        `json:"to_user_id,omitempty"`
 	ClientID     string        `json:"client_id,omitempty"`
 	CreateTimeMS int64         `json:"create_time_ms,omitempty"`
@@ -198,4 +204,36 @@ type GetUploadURLResp struct {
 	Ret              int    `json:"ret"`
 	UploadParam      string `json:"upload_param"`
 	ThumbUploadParam string `json:"thumb_upload_param"`
+}
+
+// NotifyStartReq is the body of POST /ilink/bot/msg/notifystart.
+//
+// In the official @tencent-weixin/openclaw-weixin plugin the gateway calls
+// this when a channel account becomes active (after QR-confirm or on host
+// startup) before entering the getupdates long-poll. The server appears to
+// treat it as "this bot is now online, route inbound messages to me". Some
+// deployments will silently stop pushing messages to a session that never
+// announces itself, which manifests as a perpetually-empty getupdates loop
+// and an apparently-mute bot. The call is best-effort: failure is logged
+// but does not block the long-poll loop.
+type NotifyStartReq struct {
+	BaseInfo BaseInfo `json:"base_info"`
+}
+
+type NotifyStartResp struct {
+	Ret    int    `json:"ret"`
+	ErrMsg string `json:"errmsg,omitempty"`
+}
+
+// NotifyStopReq is the body of POST /ilink/bot/msg/notifystop.
+//
+// Symmetric counterpart of NotifyStartReq. Sent on graceful shutdown so the
+// server knows to stop holding long-poll connections / re-route inbound.
+type NotifyStopReq struct {
+	BaseInfo BaseInfo `json:"base_info"`
+}
+
+type NotifyStopResp struct {
+	Ret    int    `json:"ret"`
+	ErrMsg string `json:"errmsg,omitempty"`
 }
