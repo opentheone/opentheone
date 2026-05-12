@@ -1,0 +1,100 @@
+version: 2
+
+updates:
+  # Go modules — bumped weekly, grouped by major-version family to keep the
+  # PR firehose manageable.
+  - package-ecosystem: "gomod"
+    directory: "/backend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "go"
+    commit-message:
+      prefix: "chore(deps,go)"
+    groups:
+      gin:
+        patterns:
+          - "github.com/gin-gonic/gin"
+          - "github.com/gin-contrib/*"
+      gorm:
+        patterns:
+          - "gorm.io/*"
+      observability:
+        patterns:
+          - "go.uber.org/zap"
+          - "github.com/prometheus/*"
+      go-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # npm — frontend. Group all non-major together; keep majors as individual PRs
+  # so a v3 → v4 jump can't sneak in unreviewed.
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "javascript"
+    commit-message:
+      prefix: "chore(deps,frontend)"
+    groups:
+      vue:
+        patterns:
+          - "vue"
+          - "vue-router"
+          - "pinia"
+          - "@vitejs/*"
+          - "@vue/*"
+      tooling:
+        patterns:
+          - "typescript"
+          - "vite"
+          - "vue-tsc"
+          - "tailwindcss"
+          - "postcss"
+          - "autoprefixer"
+      npm-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # GitHub Actions workflows — keep them up to date so we don't get surprised
+  # by deprecation warnings on actions/upload-artifact etc.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Shanghai"
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "chore(deps,ci)"
+
+  # Docker base images. The Dockerfile pins golang:1.25-alpine, node:20-alpine,
+  # alpine:3.20 — Dependabot will open a PR when a security patch lands.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Shanghai"
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "chore(deps,docker)"

@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Frontend (lint + build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile || pnpm install
+
+      - name: Type check + production build
+        working-directory: frontend
+        run: pnpm build
+
+      - name: Upload built dist as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: backend/internal/web/dist
+          if-no-files-found: error
+
+  backend:
+    name: Backend (vet + test + build)
+    needs: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: backend/go.sum
+
+      # The Go build embeds frontend/dist via go:embed; pull it in from the previous job
+      # so we exercise the same end-to-end binary that ships in releases.
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: backend/internal/web/dist
+
+      - name: gofmt check
+        working-directory: backend
+        run: |
+          diff <(gofmt -s -d .) /dev/null
+
+      - name: go vet
+        working-directory: backend
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.61
+          working-directory: backend
+          args: --timeout=5m
+
+      - name: go test
+        working-directory: backend
+        run: go test -race -count=1 ./...
+
+      - name: go build (e2e binary with embedded frontend)
+        working-directory: backend
+        run: |
+          CGO_ENABLED=1 go build \
+            -trimpath \
+            -ldflags="-X main.Version=ci -X main.Commit=${GITHUB_SHA:0:7} -X main.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o oto-server ./cmd/server
+          ./oto-server --version
+
+  docker:
+    name: Docker image build (smoke)
+    needs: [frontend, backend]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: opentheone:ci
+          build-args: |
+            VERSION=ci-${{ github.sha }}
+            COMMIT=${{ github.sha }}
+            BUILD_TIME=ci

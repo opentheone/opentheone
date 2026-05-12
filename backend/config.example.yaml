@@ -1,0 +1,33 @@
+# OpenTheOne 配置示例。
+# 也可以通过环境变量覆盖，格式: OTO_<SECTION>_<KEY>，例如 OTO_SERVER_LISTEN=:9090。
+
+server:
+  listen: ":8080"
+  base_url: "http://localhost:8080"
+
+database:
+  driver: sqlite           # sqlite / postgres
+  dsn: "data/oto.db"       # sqlite 路径 / postgres dsn
+
+auth:
+  # 留空时，服务首次启动会自动在 storage.data_dir 下生成 secret.key 并写入；
+  # 也可以填一个长度 >=16 的随机字符串。请勿使用文档/示例里的占位串。
+  jwt_secret: ""
+  jwt_expire_hours: 168
+  allow_register: true     # 关闭后只允许第一位（创世）用户注册
+
+ilink:
+  base_url: "https://ilinkai.weixin.qq.com"
+  cdn_base_url: "https://novac2c.cdn.weixin.qq.com/c2c"
+  channel_version: "1.0.0"
+  long_poll_timeout_ms: 35000
+  user_agent: "opentheone/0.1"
+  sk_route_tag: ""         # 部署方下发的路由标签，无需可留空
+
+storage:
+  data_dir: "data"
+  attachments_dir: "data/attachments"
+
+logging:
+  level: "info"            # debug / info / warn / error
+  format: "console"        # console / json

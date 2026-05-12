@@ -1,12 +1,11 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
 # Binaries for programs and plugins
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
+backend/oto-server
+backend/oto-server-*
 
 # Test binary, built with `go test -c`
 *.test
@@ -26,7 +25,35 @@ go.work.sum
 
 # env file
 .env
+.env.*
+!.env.example
 
 # Editor/IDE
 # .idea/
 # .vscode/
+*.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+backend/*.log
+
+# Runtime data (SQLite db, attachments, auto-generated JWT secret)
+backend/data/
+backend/config.yaml
+
+# Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Embedded frontend build output (regenerated on every `pnpm build`).
+# We keep an index.html placeholder so the Go module always compiles, but
+# ignore everything else.
+backend/internal/web/dist/*
+!backend/internal/web/dist/index.html

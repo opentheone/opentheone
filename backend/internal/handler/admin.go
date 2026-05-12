@@ -1,0 +1,262 @@
+package handler
+
+import (
+	"net/http"
+	"os"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+
+	"github.com/wzyjerry/opentheone/backend/internal/auth"
+	"github.com/wzyjerry/opentheone/backend/internal/model"
+	"github.com/wzyjerry/opentheone/backend/internal/runner"
+	"github.com/wzyjerry/opentheone/backend/internal/settings"
+)
+
+type AdminHandler struct {
+	db       *gorm.DB
+	settings *settings.Service
+	mgr      *runner.Manager
+}
+
+func NewAdminHandler(db *gorm.DB, set *settings.Service, mgr *runner.Manager) *AdminHandler {
+	return &AdminHandler{db: db, settings: set, mgr: mgr}
+}
+
+type adminUserItem struct {
+	ID          string `json:"id"`
+	Username    string `json:"username"`
+	DisplayName string `json:"display_name"`
+	Role        string `json:"role"`
+	CreatedAt   string `json:"created_at"`
+}
+
+// ListUsers returns every user (admin only).
+func (h *AdminHandler) ListUsers(c *gin.Context) {
+	var rows []model.User
+	if err := h.db.Order("created_at asc").Find(&rows).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 500, err.Error())
+		return
+	}
+	out := make([]adminUserItem, 0, len(rows))
+	for _, u := range rows {
+		out = append(out, adminUserItem{
+			ID:          u.ID,
+			Username:    u.Username,
+			DisplayName: u.DisplayName,
+			Role:        u.Role,
+			CreatedAt:   u.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		})
+	}
+	ok(c, gin.H{"items": out})
+}
+
+type adminSetRoleReq struct {
+	UserID string `json:"user_id"`
+	Role   string `json:"role"`
+}
+
+// SetRole sets a user's role. The last admin cannot be demoted.
+func (h *AdminHandler) SetRole(c *gin.Context) {
+	var req adminSetRoleReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		fail(c, http.StatusBadRequest, 400, "invalid json")
+		return
+	}
+	if req.Role != "admin" && req.Role != "user" {
+		fail(c, http.StatusBadRequest, 400, "role must be admin|user")
+		return
+	}
+	var target model.User
+	if err := h.db.Where("id = ?", req.UserID).First(&target).Error; err != nil {
+		fail(c, http.StatusNotFound, 404, "user not found")
+		return
+	}
+	if target.Role == "admin" && req.Role != "admin" {
+		var admins int64
+		_ = h.db.Model(&model.User{}).Where("role = ?", "admin").Count(&admins).Error
+		if admins <= 1 {
+			fail(c, http.StatusBadRequest, 400, "refuse to demote the last admin")
+			return
+		}
+	}
+	if err := h.db.Model(&target).Update("role", req.Role).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 500, err.Error())
+		return
+	}
+	ok(c, gin.H{"ok": true})
+}
+
+type adminResetPasswordReq struct {
+	UserID      string `json:"user_id"`
+	NewPassword string `json:"new_password"`
+}
+
+// ResetPassword overwrites another user's password (admin only).
+func (h *AdminHandler) ResetPassword(c *gin.Context) {
+	var req adminResetPasswordReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		fail(c, http.StatusBadRequest, 400, "invalid json")
+		return
+	}
+	if len(req.NewPassword) < 6 {
+		fail(c, http.StatusBadRequest, 400, "password too short (min 6)")
+		return
+	}
+	var target model.User
+	if err := h.db.Where("id = ?", req.UserID).First(&target).Error; err != nil {
+		fail(c, http.StatusNotFound, 404, "user not found")
+		return
+	}
+	pw, err := auth.HashPassword(req.NewPassword)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 500, err.Error())
+		return
+	}
+	if err := h.db.Model(&target).Update("password_hash", pw).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 500, err.Error())
+		return
+	}
+	ok(c, gin.H{"ok": true})
+}
+
+type adminDeleteUserReq struct {
+	UserID string `json:"user_id"`
+}
+
+// DeleteUser removes a user.
+// All of their personas / bindings / conversations / messages / memories / llm configs are cascaded.
+// The caller cannot delete themselves; the last admin cannot be deleted.
+func (h *AdminHandler) DeleteUser(c *gin.Context) {
+	uid := currentUserID(c)
+	var req adminDeleteUserReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		fail(c, http.StatusBadRequest, 400, "invalid json")
+		return
+	}
+	if req.UserID == uid {
+		fail(c, http.StatusBadRequest, 400, "cannot delete yourself")
+		return
+	}
+	var target model.User
+	if err := h.db.Where("id = ?", req.UserID).First(&target).Error; err != nil {
+		fail(c, http.StatusNotFound, 404, "user not found")
+		return
+	}
+	if target.Role == "admin" {
+		var admins int64
+		_ = h.db.Model(&model.User{}).Where("role = ?", "admin").Count(&admins).Error
+		if admins <= 1 {
+			fail(c, http.StatusBadRequest, 400, "refuse to delete the last admin")
+			return
+		}
+	}
+
+	var personaIDs []string
+	_ = h.db.Model(&model.Persona{}).Where("user_id = ?", req.UserID).Pluck("id", &personaIDs).Error
+	var bindingIDs []string
+	_ = h.db.Model(&model.WeChatBinding{}).Where("user_id = ?", req.UserID).Pluck("id", &bindingIDs).Error
+	var convIDs []string
+	if len(bindingIDs) > 0 {
+		_ = h.db.Model(&model.Conversation{}).Where("binding_id IN ?", bindingIDs).Pluck("id", &convIDs).Error
+	}
+	var attachmentPaths []string
+	if len(convIDs) > 0 {
+		_ = h.db.Model(&model.Attachment{}).
+			Joins("JOIN messages ON attachments.message_id = messages.id").
+			Where("messages.conversation_id IN ?", convIDs).
+			Pluck("attachments.local_path", &attachmentPaths).Error
+	}
+
+	for _, bid := range bindingIDs {
+		h.mgr.Stop(bid)
+	}
+
+	tx := h.db.Begin()
+	if len(convIDs) > 0 {
+		if err := tx.Exec(`DELETE FROM attachments WHERE message_id IN (
+			SELECT id FROM messages WHERE conversation_id IN ?
+		)`, convIDs).Error; err != nil {
+			tx.Rollback()
+			fail(c, http.StatusInternalServerError, 500, err.Error())
+			return
+		}
+		if err := tx.Where("conversation_id IN ?", convIDs).Delete(&model.Message{}).Error; err != nil {
+			tx.Rollback()
+			fail(c, http.StatusInternalServerError, 500, err.Error())
+			return
+		}
+		if err := tx.Where("id IN ?", convIDs).Delete(&model.Conversation{}).Error; err != nil {
+			tx.Rollback()
+			fail(c, http.StatusInternalServerError, 500, err.Error())
+			return
+		}
+	}
+	if len(bindingIDs) > 0 {
+		if err := tx.Where("id IN ?", bindingIDs).Delete(&model.WeChatBinding{}).Error; err != nil {
+			tx.Rollback()
+			fail(c, http.StatusInternalServerError, 500, err.Error())
+			return
+		}
+	}
+	if len(personaIDs) > 0 {
+		if err := tx.Where("persona_id IN ?", personaIDs).Delete(&model.Memory{}).Error; err != nil {
+			tx.Rollback()
+			fail(c, http.StatusInternalServerError, 500, err.Error())
+			return
+		}
+		if err := tx.Where("id IN ?", personaIDs).Delete(&model.Persona{}).Error; err != nil {
+			tx.Rollback()
+			fail(c, http.StatusInternalServerError, 500, err.Error())
+			return
+		}
+	}
+	if err := tx.Where("user_id = ?", req.UserID).Delete(&model.LLMConfig{}).Error; err != nil {
+		tx.Rollback()
+		fail(c, http.StatusInternalServerError, 500, err.Error())
+		return
+	}
+	if err := tx.Where("id = ?", req.UserID).Delete(&model.User{}).Error; err != nil {
+		tx.Rollback()
+		fail(c, http.StatusInternalServerError, 500, err.Error())
+		return
+	}
+	tx.Commit()
+
+	for _, p := range attachmentPaths {
+		if p != "" {
+			_ = os.Remove(p)
+		}
+	}
+
+	ok(c, gin.H{"ok": true})
+}
+
+// GetSettings returns all surfaced settings.
+func (h *AdminHandler) GetSettings(c *gin.Context) {
+	ok(c, gin.H{
+		"allow_register": h.settings.GetBool(settings.KeyAllowRegister, true),
+	})
+}
+
+type adminUpdateSettingsReq struct {
+	AllowRegister *bool `json:"allow_register"`
+}
+
+// UpdateSettings updates one or more known settings.
+func (h *AdminHandler) UpdateSettings(c *gin.Context) {
+	var req adminUpdateSettingsReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		fail(c, http.StatusBadRequest, 400, "invalid json")
+		return
+	}
+	if req.AllowRegister != nil {
+		if err := h.settings.SetBool(settings.KeyAllowRegister, *req.AllowRegister); err != nil {
+			fail(c, http.StatusInternalServerError, 500, err.Error())
+			return
+		}
+	}
+	ok(c, gin.H{
+		"allow_register": h.settings.GetBool(settings.KeyAllowRegister, true),
+	})
+}

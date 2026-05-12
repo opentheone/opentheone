@@ -1,0 +1,61 @@
+name: CodeQL
+
+# Static analysis for security & correctness issues in Go and the Vue/TS frontend.
+# Findings show up under the repo's "Security" → "Code scanning" tab.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly sweep on Mondays at 02:00 UTC. CodeQL queries get updated by GitHub
+    # over time, so a cold rerun catches issues that didn't exist when the PR landed.
+    - cron: "0 2 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  analyze:
+    name: Analyze ${{ matrix.language }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: go
+            build-mode: autobuild
+          - language: javascript-typescript
+            build-mode: none
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - if: matrix.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: backend/go.sum
+
+      # The Go autobuilder runs `go build ./...`, which needs the embedded frontend
+      # placeholder to exist. Our repo ships `backend/internal/web/dist/index.html`
+      # specifically for this purpose, so we don't need to run `pnpm build` here.
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: security-extended
+
+      - if: matrix.build-mode == 'autobuild'
+        uses: github/codeql-action/autobuild@v3
+        with:
+          working-directory: backend
+
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"

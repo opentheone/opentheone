@@ -1,0 +1,244 @@
+name: Release
+
+# Cuts a release when a `v*` tag is pushed. Two parallel deliverables:
+#
+#   1. Native CGO binaries (linux amd64/arm64, darwin amd64/arm64, windows amd64)
+#      attached to the GitHub Release as tar.gz / zip with SHA-256 checksums.
+#   2. Multi-arch Docker image (linux amd64 + arm64) pushed to
+#      ghcr.io/<owner>/opentheone:<version> + :latest.
+#
+# CGO is required by github.com/mattn/go-sqlite3, so we deliberately use a
+# build matrix of *native* runners (no cross-compile gymnastics). It's a few
+# more minutes of CI but it always works.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  ###########################################################################
+  # 1. Build the embedded frontend once, share it across all binary builds.
+  ###########################################################################
+  frontend:
+    name: Build frontend bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: pnpm build
+        working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile || pnpm install
+          pnpm build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: backend/internal/web/dist
+          if-no-files-found: error
+          retention-days: 1
+
+  ###########################################################################
+  # 2. Build native CGO binaries per (OS, arch). One artifact per pair.
+  ###########################################################################
+  binaries:
+    name: Build ${{ matrix.target.os }}/${{ matrix.target.arch }}
+    needs: frontend
+    runs-on: ${{ matrix.target.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          # Linux: one native (amd64) + one cross (arm64) using zig-as-cc.
+          - { os: linux,   arch: amd64, runner: ubuntu-latest,  ext: "",     archive: tar.gz }
+          - { os: linux,   arch: arm64, runner: ubuntu-24.04-arm, ext: "",   archive: tar.gz }
+          - { os: darwin,  arch: amd64, runner: macos-13,       ext: "",     archive: tar.gz }
+          - { os: darwin,  arch: arm64, runner: macos-14,       ext: "",     archive: tar.gz }
+          - { os: windows, arch: amd64, runner: windows-latest, ext: ".exe", archive: zip }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: backend/go.sum
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: backend/internal/web/dist
+
+      - name: Resolve version metadata
+        id: meta
+        shell: bash
+        run: |
+          ver="${GITHUB_REF_NAME}"
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+          echo "commit=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build oto-server
+        working-directory: backend
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.target.os }}
+          GOARCH: ${{ matrix.target.arch }}
+        run: |
+          out="oto-server${{ matrix.target.ext }}"
+          go build \
+            -trimpath \
+            -ldflags="-s -w \
+              -X main.Version=${{ steps.meta.outputs.version }} \
+              -X main.Commit=${{ steps.meta.outputs.commit }} \
+              -X main.BuildTime=${{ steps.meta.outputs.build_time }}" \
+            -o "$out" ./cmd/server
+          ls -la "$out"
+
+      - name: Stage release files
+        shell: bash
+        run: |
+          base="opentheone_${{ steps.meta.outputs.version }}_${{ matrix.target.os }}_${{ matrix.target.arch }}"
+          mkdir -p "dist/$base"
+          cp "backend/oto-server${{ matrix.target.ext }}" "dist/$base/"
+          cp LICENSE README.md CHANGELOG.md "dist/$base/"
+          cp backend/config.example.yaml "dist/$base/"
+          echo "base=$base" >> "$GITHUB_ENV"
+
+      - name: Pack tar.gz
+        if: matrix.target.archive == 'tar.gz'
+        shell: bash
+        run: |
+          cd dist && tar -czf "${base}.tar.gz" "$base" && sha256sum "${base}.tar.gz" > "${base}.tar.gz.sha256"
+
+      - name: Pack zip
+        if: matrix.target.archive == 'zip'
+        shell: bash
+        run: |
+          cd dist
+          # On Windows runner `zip` may not exist; use PowerShell.
+          if command -v zip >/dev/null 2>&1; then
+            zip -r "${base}.zip" "$base"
+          else
+            powershell -Command "Compress-Archive -Path '${base}' -DestinationPath '${base}.zip'"
+          fi
+          # CertUtil produces noisy output; use sha256sum if installed (git-bash), else PowerShell.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${base}.zip" > "${base}.zip.sha256"
+          else
+            powershell -Command "(Get-FileHash '${base}.zip' -Algorithm SHA256).Hash.ToLower() + '  ${base}.zip'" > "${base}.zip.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target.os }}-${{ matrix.target.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  ###########################################################################
+  # 3. Aggregate artifacts and publish the GitHub Release.
+  ###########################################################################
+  publish:
+    name: Publish GitHub Release
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Concatenate per-arch checksums into one file
+        run: |
+          cd dist
+          cat *.sha256 > opentheone_${{ github.ref_name }}_SHA256SUMS
+          ls -la
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: OpenTheOne ${{ github.ref_name }}
+          body: |
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for the full diff.
+
+            ## Verify
+            ```bash
+            sha256sum -c opentheone_${{ github.ref_name }}_SHA256SUMS
+            ```
+
+            ## Run with Docker
+            ```bash
+            docker pull ghcr.io/${{ github.repository_owner }}/opentheone:${{ github.ref_name }}
+            ```
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/opentheone_*_SHA256SUMS
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+
+  ###########################################################################
+  # 4. Multi-arch Docker image to GHCR. Runs in parallel with binary publish.
+  ###########################################################################
+  docker:
+    name: Push multi-arch image
+    needs: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/opentheone
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ github.event.head_commit.timestamp }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,24 @@
+# Code owners for OpenTheOne
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# Every PR is auto-requested for review by the listed owners. The last matching
+# pattern wins, so put more specific rules below more general ones.
+
+# Default: everything goes to the project lead.
+*                                       @wzyjerry
+
+# CI / release infra needs an extra pair of eyes — easy to break silently.
+/.github/                               @wzyjerry
+/Dockerfile                             @wzyjerry
+/docker-compose.yml                     @wzyjerry
+/Makefile                               @wzyjerry
+
+# Security-sensitive surfaces.
+/backend/internal/auth/                 @wzyjerry
+/backend/internal/crypto/               @wzyjerry
+/backend/internal/middleware/           @wzyjerry
+/SECURITY.md                            @wzyjerry
+
+# Protocol layer: any change here must be cross-checked against the official
+# Tencent ClawBot / iLink docs.
+/backend/internal/ilink/                @wzyjerry

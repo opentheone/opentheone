@@ -1,0 +1,106 @@
+# golangci-lint v2 configuration for OpenTheOne.
+#
+# Goal: enforce a *baseline* of obvious wins (errcheck, govet, staticcheck,
+# gosec) without drowning contributors in stylistic nits. Add linters
+# gradually as the codebase stabilises.
+
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  build-tags:
+    - integration
+
+linters:
+  default: none
+  enable:
+    - errcheck      # unchecked errors
+    - govet         # vet's full suite
+    - ineffassign   # assigned but never used
+    - staticcheck   # large catalogue of correctness checks (includes gosimple/stylecheck in v2)
+    - unused        # unused funcs / vars / consts
+    - misspell      # English typos
+    - bodyclose     # http response bodies must be closed
+    - rowserrcheck  # sql.Rows.Err() must be checked
+    - sqlclosecheck # sql.Rows / sql.Stmt must be closed
+    - copyloopvar   # Go 1.22+ loop var semantics
+    - gosec         # security issues (subprocess injection, weak crypto, etc.)
+
+  settings:
+    errcheck:
+      check-type-assertions: false
+      check-blank: false
+      exclude-functions:
+        # Idiomatic `defer foo.Close()` patterns. Handling these errors after
+        # we've already read what we wanted is impossible (the read either
+        # finished or returned an error of its own); failing to do so leaks
+        # the underlying fd at process exit but that's already too late.
+        - (io.Closer).Close
+        - (net/http.ResponseWriter).Write
+        # zap's Sync at process exit is documented to be best-effort; any
+        # actual write error during normal logging is reported separately.
+        - (*go.uber.org/zap.Logger).Sync
+        - (*go.uber.org/zap.SugaredLogger).Sync
+        # gin context writes that can't realistically be handled — we always
+        # respond on a fresh ResponseWriter; if the network died there is
+        # nothing to do.
+        - (*github.com/gin-gonic/gin.Context).Error
+
+    gosec:
+      excludes:
+        # G104 (errors unhandled) overlaps with errcheck — already covered.
+        - G104
+        # G304 (file inclusion via variable) is fundamental to the attachment
+        # handler — every flagged read is constrained by a DB lookup that
+        # resolves a UUID to a server-controlled path. Spot-checked by hand.
+        - G304
+        # G118 (goroutine using context.Background) is a deliberate pattern
+        # in OpenTheOne: background tasks (attachment download, memory
+        # ingestion, rolling summary, QR scan polling) MUST outlive the
+        # request that triggered them. Each such site explicitly switches to
+        # context.WithTimeout(context.Background(), …); reverting to the
+        # request ctx would cancel them as soon as the HTTP response flushed.
+        - G118
+
+    misspell:
+      locale: US
+
+    staticcheck:
+      checks:
+        - "all"
+        # ST1000 (missing package comment) is noisy for internal packages.
+        - "-ST1000"
+
+  exclusions:
+    rules:
+      # Test files are allowed to ignore returned errors more freely — they
+      # often call helpers like `_ = file.Close()` after assertions.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+
+      # GORM frequently produces `errors.Is(err, gorm.ErrRecordNotFound)` flows
+      # where the "error" branch is the happy path; we don't always store the
+      # err if we're about to fail the request anyway. errcheck false-positives.
+      - path: internal/handler/.*\.go
+        text: "Error return value of `.*\\.(First|Find|Where)` is not checked"
+        linters:
+          - errcheck
+
+    paths:
+      - internal/web/dist
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/wzyjerry/opentheone
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

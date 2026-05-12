@@ -1,0 +1,28 @@
+.git
+.github
+.gitignore
+.dockerignore
+.vscode
+.idea
+Dockerfile
+docker-compose.yml
+Makefile
+README.md
+LICENSE
+doc.md
+*.md
+
+# Backend build artifacts and runtime data
+backend/oto-server
+backend/data/
+backend/config.yaml
+**/*.test
+**/*.out
+**/coverage.*
+
+# Frontend node modules and dist (dist gets regenerated inside the image)
+frontend/node_modules/
+frontend/dist/
+
+# Pre-built embedded assets (regenerated in stage 1 of the multi-stage build)
+backend/internal/web/dist/assets/

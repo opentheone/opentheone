@@ -1,0 +1,107 @@
+name: 🐛 Bug 报告 / Bug report
+description: 报告一个可复现的问题
+title: "bug: <一句话描述>"
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢报告 bug。**没有复现步骤的 bug 报告几乎一定会被关闭**，请认真填写下面的内容。
+        Thanks for the bug report. Without reproduction steps a bug report is almost
+        guaranteed to be closed. Please fill the fields below carefully.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 现象 / What happened?
+      description: 我做了什么操作？我看到了什么不对劲的结果？
+      placeholder: 我在 Persona 详情页点了"设为唯一"，UI 卡在加载状态，但后端日志没有任何输出……
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为 / Expected behaviour
+      description: 你认为正确的结果应该是什么样的？
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤 / Steps to reproduce
+      description: |
+        请提供最小可复现路径。如果是首次部署即可复现，请说明；如果需要先有数据再复现，
+        请把构造数据的步骤一起列出来。
+      placeholder: |
+        1. `docker compose up -d`
+        2. 浏览器访问 http://localhost:8080，注册账号 `alice`
+        3. 进入「模型」页面，点 DeepSeek 预置，填入 sk-xxx
+        4. ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / Version
+      description: 运行 `oto-server --version` 或 `docker exec opentheone oto-server --version`
+      placeholder: "v0.1.0 (commit abcdef1, built 2026-05-13T00:00:00Z)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deploy
+    attributes:
+      label: 部署形态 / Deployment
+      options:
+        - "docker compose"
+        - "docker run（手工）"
+        - "二进制（直接跑 oto-server）"
+        - "源码（go run）"
+        - "其他"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: 运行环境 / Host OS
+      options:
+        - "Linux (amd64)"
+        - "Linux (arm64)"
+        - "macOS (Intel)"
+        - "macOS (Apple Silicon)"
+        - "Windows"
+        - "其他"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志 / Relevant logs
+      description: |
+        贴上后端 stdout 里和这次复现时间窗附近的内容（zap 输出）。
+        **请先把里面的 API Key / JWT / 个人聊天内容打码再贴。**
+      render: shell
+
+  - type: textarea
+    id: config
+    attributes:
+      label: 关键配置 / Relevant config
+      description: |
+        贴出 `backend/config.yaml` 中关键字段（已脱敏），或者 `docker compose` 里你改动过的 `OTO_*` 环境变量。
+      render: yaml
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: 自查 / Self-check
+      options:
+        - label: 我已搜索过现有 issues，没有重复
+          required: true
+        - label: 我已把贴出的日志/配置脱敏（API Key、个人聊天内容、用户名等）
+          required: true
+        - label: 我能在最新一次 `main` 上稳定复现
