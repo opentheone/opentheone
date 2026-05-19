@@ -75,7 +75,7 @@ jobs:
       # previous combo (action v6 + golangci-lint v1.61 + v2 config) was
       # internally inconsistent and would fail to load the config at runtime.
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v8
+        uses: golangci/golangci-lint-action@v9
         with:
           version: v2.1.0
           working-directory: backend
