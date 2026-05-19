@@ -141,13 +141,13 @@ func (c *Client) ChatWithTools(
 	defer stream.Close()
 
 	var (
-		buf            string
-		finishReason   string
+		buf          string
+		finishReason string
 		// tool-call accumulator: index → partial call
-		callsByIndex   = map[int]*ToolCall{}
+		callsByIndex = map[int]*ToolCall{}
 		// preserve emission order so we feed them back in the order the model
 		// declared them (mirrors how OpenAI numbers parallel calls).
-		callOrder      []int
+		callOrder []int
 	)
 
 	for {
