@@ -49,7 +49,7 @@ RUN CGO_ENABLED=1 GOOS=linux \
 ####################################
 # Stage 3: minimal runtime image
 ####################################
-FROM alpine:3.20
+FROM alpine:3.23
 RUN apk add --no-cache ca-certificates tzdata && \
     addgroup -S oto && adduser -S oto -G oto
 
