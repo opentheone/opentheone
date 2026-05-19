@@ -124,7 +124,17 @@ jobs:
         if: matrix.target.archive == 'tar.gz'
         shell: bash
         run: |
-          cd dist && tar -czf "${base}.tar.gz" "$base" && sha256sum "${base}.tar.gz" > "${base}.tar.gz.sha256"
+          cd dist
+          tar -czf "${base}.tar.gz" "$base"
+          # macOS runners (macos-13 / macos-14) ship `shasum` instead of
+          # `sha256sum`. Both emit the same `<hex>  <file>` line format that
+          # `sha256sum -c` later accepts, so the verify step downstream
+          # doesn't care which one we used here.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${base}.tar.gz" > "${base}.tar.gz.sha256"
+          else
+            shasum -a 256 "${base}.tar.gz" > "${base}.tar.gz.sha256"
+          fi
 
       - name: Pack zip
         if: matrix.target.archive == 'zip'

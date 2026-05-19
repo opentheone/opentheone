@@ -6,7 +6,13 @@ WORKDIR /src/frontend
 
 # Cache deps first so source-only changes don't bust the layer.
 COPY frontend/package.json frontend/pnpm-lock.yaml* ./
-RUN corepack enable && pnpm install --frozen-lockfile || pnpm install
+# Don't use corepack: the version bundled with node:20-alpine ships a pnpm
+# tarball that breaks at runtime with `ERR_UNKNOWN_BUILTIN_MODULE` on
+# Node ≥ 20.20. Install pnpm directly to side-step that whole moving target;
+# pin to pnpm@9 because our pnpm-lock.yaml is lockfileVersion 9.0 and a v10
+# pnpm would silently rewrite it on `install --frozen-lockfile`.
+RUN npm install -g pnpm@9 \
+ && (pnpm install --frozen-lockfile || pnpm install)
 
 COPY frontend/ ./
 # vite is configured to emit into ../backend/internal/web/dist
