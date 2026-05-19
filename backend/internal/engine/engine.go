@@ -307,8 +307,13 @@ func (e *Engine) HandleInbound(ctx context.Context, binding *model.WeChatBinding
 			return err
 		}
 		if err := e.ilink.SendTextMessage(ctx, sess, msg.FromUserID, msg.ContextToken, clientID, chunk); err != nil {
+			// Column-scoped update — rewriting the whole row via Save would
+			// also clobber any concurrent edit and write 10+ columns we don't
+			// need to touch.
 			out.Status = "failed"
-			_ = e.db.WithContext(ctx).Save(&out).Error
+			_ = e.db.WithContext(ctx).Model(&model.Message{}).
+				Where("id = ?", out.ID).
+				Update("status", "failed").Error
 			e.log.Error("sendmessage failed",
 				zap.Error(err),
 				zap.Int("chunk_idx", i),
@@ -317,7 +322,9 @@ func (e *Engine) HandleInbound(ctx context.Context, binding *model.WeChatBinding
 			return err
 		}
 		out.Status = "sent"
-		if err := e.db.WithContext(ctx).Save(&out).Error; err != nil {
+		if err := e.db.WithContext(ctx).Model(&model.Message{}).
+			Where("id = ?", out.ID).
+			Update("status", "sent").Error; err != nil {
 			stopTyping()
 			return err
 		}
@@ -885,5 +892,24 @@ func (e *Engine) SendProactive(ctx context.Context, binding *model.WeChatBinding
 	_ = e.db.WithContext(ctx).Model(&model.Conversation{}).
 		Where("id = ?", conv.ID).
 		Update("last_message_at", now).Error
+
+	// Fire-and-forget rolling summary. HandleInbound does this on every
+	// reply, but proactive sends don't go through HandleInbound — so a
+	// persona that sends daily greetings into a one-sided conversation
+	// would accumulate outbound messages past `historyN + summaryEvery`
+	// forever, and the next inbound reply would blow up the prompt
+	// budget. Run on a fresh background context so a slow summarize
+	// doesn't extend the proactive RPC's deadline.
+	go func(c model.Conversation, cfg model.LLMConfig) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				e.log.Error("MaybeSummarize (proactive) panicked", zap.Any("panic", rec))
+			}
+		}()
+		bg, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		e.MaybeSummarize(bg, &c, &cfg)
+	}(conv, *llmCfg)
+
 	return nil
 }

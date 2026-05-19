@@ -1,13 +1,19 @@
 services:
   opentheone:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        VERSION: ${OTO_VERSION:-dev}
-        COMMIT: ${OTO_COMMIT:-local}
-        BUILD_TIME: ${OTO_BUILD_TIME:-local}
-    image: opentheone:local
+    # Default to the prebuilt multi-arch image published by the Release
+    # workflow (linux/amd64 + linux/arm64). Override OTO_IMAGE to pin a
+    # specific version, e.g. `OTO_IMAGE=ghcr.io/opentheone/opentheone:v0.0.3`.
+    image: ${OTO_IMAGE:-ghcr.io/opentheone/opentheone:latest}
+    # Contributors who want to build from local source instead of pulling
+    # from GHCR can uncomment the block below and run
+    # `docker compose up -d --build`.
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    #   args:
+    #     VERSION: ${OTO_VERSION:-dev}
+    #     COMMIT: ${OTO_COMMIT:-local}
+    #     BUILD_TIME: ${OTO_BUILD_TIME:-local}
     container_name: opentheone
     restart: unless-stopped
     ports:

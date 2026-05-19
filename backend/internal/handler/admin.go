@@ -101,7 +101,7 @@ func (h *AdminHandler) ResetPassword(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 400, "invalid json")
 		return
 	}
-	if len(req.NewPassword) < 6 {
+	if len(req.NewPassword) < minPasswordLen {
 		fail(c, http.StatusBadRequest, 400, "password too short (min 6)")
 		return
 	}
@@ -180,56 +180,51 @@ func (h *AdminHandler) DeleteUser(c *gin.Context) {
 	}
 
 	tx := h.db.Begin()
+	// See conversation.Delete: defer-rollback guarantees the tx unwinds on
+	// panic or any future early-return path; it's a no-op after a successful
+	// Commit (sql.ErrTxDone is swallowed).
+	defer func() { _ = tx.Rollback() }()
 	if len(convIDs) > 0 {
 		if err := tx.Exec(`DELETE FROM attachments WHERE message_id IN (
 			SELECT id FROM messages WHERE conversation_id IN ?
 		)`, convIDs).Error; err != nil {
-			tx.Rollback()
 			fail(c, http.StatusInternalServerError, 500, err.Error())
 			return
 		}
 		if err := tx.Where("conversation_id IN ?", convIDs).Delete(&model.Message{}).Error; err != nil {
-			tx.Rollback()
 			fail(c, http.StatusInternalServerError, 500, err.Error())
 			return
 		}
 		if err := tx.Where("id IN ?", convIDs).Delete(&model.Conversation{}).Error; err != nil {
-			tx.Rollback()
 			fail(c, http.StatusInternalServerError, 500, err.Error())
 			return
 		}
 	}
 	if len(bindingIDs) > 0 {
 		if err := tx.Where("id IN ?", bindingIDs).Delete(&model.WeChatBinding{}).Error; err != nil {
-			tx.Rollback()
 			fail(c, http.StatusInternalServerError, 500, err.Error())
 			return
 		}
 	}
 	if len(personaIDs) > 0 {
 		if err := tx.Where("persona_id IN ?", personaIDs).Delete(&model.Memory{}).Error; err != nil {
-			tx.Rollback()
 			fail(c, http.StatusInternalServerError, 500, err.Error())
 			return
 		}
 		if err := tx.Where("id IN ?", personaIDs).Delete(&model.Persona{}).Error; err != nil {
-			tx.Rollback()
 			fail(c, http.StatusInternalServerError, 500, err.Error())
 			return
 		}
 	}
 	if err := tx.Where("user_id = ?", req.UserID).Delete(&model.LLMConfig{}).Error; err != nil {
-		tx.Rollback()
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}
 	if err := tx.Where("user_id = ?", req.UserID).Delete(&model.MCPServer{}).Error; err != nil {
-		tx.Rollback()
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}
 	if err := tx.Where("id = ?", req.UserID).Delete(&model.User{}).Error; err != nil {
-		tx.Rollback()
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}

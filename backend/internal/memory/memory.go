@@ -184,12 +184,25 @@ func (s *Service) Ingest(ctx context.Context, llmClient *llm.Client, personaID, 
 				return nil
 			case sim >= 0.78:
 				updated := m.Content + "\n• " + content
+				upd := map[string]interface{}{
+					"content":    updated,
+					"importance": maxInt(m.Importance, importance),
+				}
+				// Refresh the locality pointers to the most recent mention so
+				// the conversation boost in RetrieveForConversation reflects
+				// the place this fact was last reinforced, not where it was
+				// first observed (a memory that originated in conversation A
+				// but keeps getting validated in conversation B should boost
+				// B going forward).
+				if conversationID != "" {
+					upd["conversation_id"] = conversationID
+				}
+				if sourceMessageID != "" {
+					upd["source_message_id"] = sourceMessageID
+				}
 				return s.db.WithContext(ctx).Model(&model.Memory{}).
 					Where("id = ?", m.ID).
-					Updates(map[string]interface{}{
-						"content":    updated,
-						"importance": maxInt(m.Importance, importance),
-					}).Error
+					Updates(upd).Error
 			}
 		}
 	}

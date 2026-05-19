@@ -76,11 +76,9 @@ func (e *Engine) downloadIfNeeded(ctx context.Context, msgID string, item *ilink
 	}
 
 	sum := sha256.Sum256(payload)
-	ext := filepath.Ext(filenameHint)
-	if ext == "" {
-		ext = ""
-	}
-	localName := hex.EncodeToString(sum[:]) + ext
+	// filepath.Ext already returns "" when there is no extension, so we can
+	// safely concatenate unconditionally.
+	localName := hex.EncodeToString(sum[:]) + filepath.Ext(filenameHint)
 	localPath := filepath.Join(e.attachmentsDir, localName)
 	if err := os.WriteFile(localPath, payload, 0o600); err != nil {
 		e.log.Debug("write attachment failed", zap.Error(err))

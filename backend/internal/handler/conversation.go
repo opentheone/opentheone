@@ -284,22 +284,23 @@ func (h *ConversationHandler) Delete(c *gin.Context) {
 		Pluck("attachments.local_path", &attachmentPaths).Error
 
 	tx := h.db.Begin()
+	// defer-rollback guarantees the tx unwinds on panic or any future
+	// early-return path. After a successful Commit it's a no-op
+	// (sql.ErrTxDone is swallowed).
+	defer func() { _ = tx.Rollback() }()
 	if err := tx.Exec(`DELETE FROM attachments WHERE message_id IN (
 		SELECT id FROM messages WHERE conversation_id = ?
 	)`, req.ConversationID).Error; err != nil {
-		tx.Rollback()
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}
 	if err := tx.Where("conversation_id = ?", req.ConversationID).
 		Delete(&model.Message{}).Error; err != nil {
-		tx.Rollback()
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}
 	if err := tx.Where("id = ?", req.ConversationID).
 		Delete(&model.Conversation{}).Error; err != nil {
-		tx.Rollback()
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}

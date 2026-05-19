@@ -31,7 +31,22 @@ type registerReq struct {
 	DisplayName string `json:"display_name"`
 }
 
+// minPasswordLen is the shared lower bound for any user-supplied password —
+// registration, self-service password change, and admin reset all enforce it.
+// Six is the same bar UpdatePassword / admin ResetPassword already used; we
+// just hadn't been enforcing it on the registration path.
+const minPasswordLen = 6
+
+// errUsernameTaken is signaled inside the transaction body to short-circuit
+// without dragging gorm.ErrRecordNotFound semantics across the boundary.
+var errUsernameTaken = errors.New("username taken")
+
 // Register creates a new user. First user is auto-promoted to admin.
+//
+// The "first user is admin" election plus the username uniqueness check are
+// both performed INSIDE one transaction so two concurrent first-time
+// registrations can't both observe `count == 0` and end up dual-admin (the
+// only race that the unique index on `username` doesn't already catch).
 func (h *AuthHandler) Register(c *gin.Context) {
 	var req registerReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -43,11 +58,18 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 400, "username & password required")
 		return
 	}
+	if len(req.Password) < minPasswordLen {
+		fail(c, http.StatusBadRequest, 400, "password too short (min 6)")
+		return
+	}
 	allow := true
 	if h.settings != nil {
 		allow = h.settings.GetBool(settings.KeyAllowRegister, true)
 	}
 	if !allow {
+		// Special-case the bootstrap window: if literally no user exists yet,
+		// we still allow this registration so the admin can be created on a
+		// fresh install where `allow_register: false` was set in config.
 		var count int64
 		_ = h.db.Model(&model.User{}).Count(&count).Error
 		if count > 0 {
@@ -56,38 +78,44 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		}
 	}
 
-	var existing model.User
-	err := h.db.Where("username = ?", req.Username).First(&existing).Error
-	if err == nil {
-		fail(c, http.StatusBadRequest, 400, "username taken")
-		return
-	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		fail(c, http.StatusInternalServerError, 500, err.Error())
-		return
-	}
-
 	pwHash, err := auth.HashPassword(req.Password)
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}
 
-	role := "user"
-	var total int64
-	_ = h.db.Model(&model.User{}).Count(&total).Error
-	if total == 0 {
-		role = "admin"
-	}
+	var u model.User
+	txErr := h.db.Transaction(func(tx *gorm.DB) error {
+		var existing model.User
+		if err := tx.Where("username = ?", req.Username).First(&existing).Error; err == nil {
+			return errUsernameTaken
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
 
-	u := model.User{
-		Username:     req.Username,
-		PasswordHash: pwHash,
-		DisplayName:  req.DisplayName,
-		Role:         role,
+		var total int64
+		if err := tx.Model(&model.User{}).Count(&total).Error; err != nil {
+			return err
+		}
+		role := "user"
+		if total == 0 {
+			role = "admin"
+		}
+
+		u = model.User{
+			Username:     req.Username,
+			PasswordHash: pwHash,
+			DisplayName:  req.DisplayName,
+			Role:         role,
+		}
+		return tx.Create(&u).Error
+	})
+	if errors.Is(txErr, errUsernameTaken) {
+		fail(c, http.StatusBadRequest, 400, "username taken")
+		return
 	}
-	if err := h.db.Create(&u).Error; err != nil {
-		fail(c, http.StatusInternalServerError, 500, err.Error())
+	if txErr != nil {
+		fail(c, http.StatusInternalServerError, 500, txErr.Error())
 		return
 	}
 
@@ -122,6 +150,10 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 400, "invalid json")
 		return
 	}
+	// Register stores the trimmed username; Login must trim too, otherwise an
+	// account created as "alice" can't be reached with a stray leading or
+	// trailing space (mobile autofill, Chinese IMEs, etc).
+	req.Username = strings.TrimSpace(req.Username)
 	var u model.User
 	if err := h.db.Where("username = ?", req.Username).First(&u).Error; err != nil {
 		fail(c, http.StatusUnauthorized, 401, "invalid credentials")
@@ -188,7 +220,7 @@ func (h *AuthHandler) UpdatePassword(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 400, "old_password & new_password required")
 		return
 	}
-	if len(req.NewPassword) < 6 {
+	if len(req.NewPassword) < minPasswordLen {
 		fail(c, http.StatusBadRequest, 400, "new_password too short (min 6)")
 		return
 	}

@@ -3,6 +3,7 @@ package proactive
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/robfig/cron/v3"
@@ -20,6 +21,15 @@ type Scheduler struct {
 	log    *zap.Logger
 	cron   *cron.Cron
 	stopCh chan struct{}
+	// inflight tracks persona IDs currently running firePersona, keyed by
+	// persona.ID with value struct{}. Without this, a slow LLM call inside
+	// G1 (started by tick T) lets the next tick T+1 spawn G2 for the same
+	// persona; G2 reads the stale LastProactiveAt (G1 hasn't written it
+	// yet) and bypasses the 6h throttle — duplicate proactive within ~60s.
+	// LoadOrStore atomically claims the slot; the goroutine deletes the
+	// entry on exit, so a clean (or panicking) firePersona naturally
+	// releases its claim.
+	inflight sync.Map
 }
 
 func NewScheduler(db *gorm.DB, eng *engine.Engine, log *zap.Logger) *Scheduler {
@@ -73,7 +83,35 @@ func (s *Scheduler) tick() {
 		if now.Sub(mostRecent) > 90*time.Second || now.Sub(mostRecent) < -2*time.Second {
 			continue
 		}
-		s.firePersona(p)
+		// Fan out per-persona work into its own goroutine. firePersona makes
+		// a synchronous LLM round-trip (potentially 30s under a slow provider);
+		// without this, two personas firing at the same minute would serialize
+		// inside the cron's single worker and the slower one could push the
+		// tick past the 1-minute interval — robfig/cron then *skips* the next
+		// tick, silently missing proactive slots. The recover keeps a panic
+		// in one persona's LLM stack from killing the cron goroutine.
+		//
+		// inflight.LoadOrStore claims the persona's slot atomically; if a
+		// prior tick's goroutine is still running for this persona we drop
+		// the duplicate before it can race the 6h throttle on a stale read.
+		// The defer releases the slot whether firePersona returns normally
+		// or panics.
+		if _, loaded := s.inflight.LoadOrStore(p.ID, struct{}{}); loaded {
+			s.log.Debug("proactive skip: previous firing still in flight",
+				zap.String("persona_id", p.ID))
+			continue
+		}
+		go func(p model.Persona) {
+			defer s.inflight.Delete(p.ID)
+			defer func() {
+				if rec := recover(); rec != nil {
+					s.log.Error("proactive firePersona panicked",
+						zap.String("persona_id", p.ID),
+						zap.Any("panic", rec))
+				}
+			}()
+			s.firePersona(p)
+		}(p)
 	}
 }
 

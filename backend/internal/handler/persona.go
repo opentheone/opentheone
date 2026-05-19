@@ -235,23 +235,24 @@ func (h *PersonaHandler) Delete(c *gin.Context) {
 	}
 
 	tx := h.db.Begin()
+	// See conversation.Delete: defer-rollback guarantees the tx unwinds on
+	// panic or any future early-return path; it's a no-op after a successful
+	// Commit (sql.ErrTxDone is swallowed).
+	defer func() { _ = tx.Rollback() }()
 	if len(convIDs) > 0 {
 		if err := tx.Exec(`DELETE FROM attachments WHERE message_id IN (
 			SELECT id FROM messages WHERE conversation_id IN ?
 		)`, convIDs).Error; err != nil {
-			tx.Rollback()
 			fail(c, http.StatusInternalServerError, 500, err.Error())
 			return
 		}
 		if err := tx.Where("conversation_id IN ?", convIDs).
 			Delete(&model.Message{}).Error; err != nil {
-			tx.Rollback()
 			fail(c, http.StatusInternalServerError, 500, err.Error())
 			return
 		}
 		if err := tx.Where("id IN ?", convIDs).
 			Delete(&model.Conversation{}).Error; err != nil {
-			tx.Rollback()
 			fail(c, http.StatusInternalServerError, 500, err.Error())
 			return
 		}
@@ -259,20 +260,17 @@ func (h *PersonaHandler) Delete(c *gin.Context) {
 	if len(bindingIDs) > 0 {
 		if err := tx.Where("id IN ?", bindingIDs).
 			Delete(&model.WeChatBinding{}).Error; err != nil {
-			tx.Rollback()
 			fail(c, http.StatusInternalServerError, 500, err.Error())
 			return
 		}
 	}
 	if err := tx.Where("persona_id = ?", req.ID).
 		Delete(&model.Memory{}).Error; err != nil {
-		tx.Rollback()
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}
 	if err := tx.Where("id = ? AND user_id = ?", req.ID, uid).
 		Delete(&model.Persona{}).Error; err != nil {
-		tx.Rollback()
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}
@@ -340,10 +338,10 @@ func (h *PersonaHandler) Deactivate(c *gin.Context) {
 	}
 
 	tx := h.db.Begin()
+	defer func() { _ = tx.Rollback() }()
 	if err := tx.Model(&model.Persona{}).
 		Where("user_id = ?", uid).
 		Update("is_active", false).Error; err != nil {
-		tx.Rollback()
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}
@@ -355,7 +353,6 @@ func (h *PersonaHandler) Deactivate(c *gin.Context) {
 		if err := tx.Model(&model.WeChatBinding{}).
 			Where("id IN ?", ids).
 			Update("state", "paused").Error; err != nil {
-			tx.Rollback()
 			fail(c, http.StatusInternalServerError, 500, err.Error())
 			return
 		}
@@ -394,17 +391,16 @@ func (h *PersonaHandler) Activate(c *gin.Context) {
 	}
 
 	tx := h.db.Begin()
+	defer func() { _ = tx.Rollback() }()
 	if err := tx.Model(&model.Persona{}).
 		Where("user_id = ?", uid).
 		Update("is_active", false).Error; err != nil {
-		tx.Rollback()
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}
 	if err := tx.Model(&model.Persona{}).
 		Where("id = ?", p.ID).
 		Update("is_active", true).Error; err != nil {
-		tx.Rollback()
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}
@@ -416,7 +412,6 @@ func (h *PersonaHandler) Activate(c *gin.Context) {
 		if err := tx.Model(&model.WeChatBinding{}).
 			Where("id IN ?", ids).
 			Update("state", "paused").Error; err != nil {
-			tx.Rollback()
 			fail(c, http.StatusInternalServerError, 500, err.Error())
 			return
 		}

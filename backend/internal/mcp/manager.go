@@ -36,6 +36,12 @@ type Manager struct {
 	mu  sync.Mutex
 	// entries are keyed by MCPServer.ID.
 	entries map[string]*cached
+	// janitor lifecycle. janitorOnce guards the launch; janitorStopOnce
+	// guards the channel close so Shutdown can honor its idempotency
+	// contract under concurrent calls (close-of-closed-channel panics).
+	janitorOnce     sync.Once
+	janitorStopOnce sync.Once
+	janitorStop     chan struct{}
 }
 
 type cached struct {
@@ -47,16 +53,80 @@ type cached struct {
 }
 
 // NewManager constructs an empty manager. Connections are opened lazily on
-// the first Get call.
+// the first Get call. A background janitor proactively reaps entries idle
+// past maxIdle so a disabled / forgotten stdio MCP subprocess doesn't keep
+// running for the lifetime of the host process.
 func NewManager(log *zap.Logger) *Manager {
-	return &Manager{
-		log:     log.With(zap.String("subsys", "mcp")),
-		entries: make(map[string]*cached),
+	m := &Manager{
+		log:         log.With(zap.String("subsys", "mcp")),
+		entries:     make(map[string]*cached),
+		janitorStop: make(chan struct{}),
+	}
+	m.startJanitor()
+	return m
+}
+
+// janitorInterval is how often the idle-eviction sweep runs. Picked at
+// maxIdle / 6 so a freshly idle entry is reaped within ~5 minutes after
+// crossing the threshold. Cheaper than every-minute scans and still tight
+// enough that operators don't notice stdio subprocesses hanging around.
+const janitorInterval = 5 * time.Minute
+
+// startJanitor launches the idle-eviction goroutine exactly once per Manager.
+// Without it, the documented maxIdle is only enforced lazily on the next
+// acquire() — meaning a stdio server that nobody is currently using would
+// keep its subprocess alive forever. The janitor closes entries whose
+// `lastUsed` is past maxIdle, mirroring the same teardown path acquire uses.
+func (m *Manager) startJanitor() {
+	m.janitorOnce.Do(func() {
+		go func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					m.log.Error("mcp janitor panicked", zap.Any("panic", rec))
+				}
+			}()
+			t := time.NewTicker(janitorInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-m.janitorStop:
+					return
+				case <-t.C:
+					m.evictStale()
+				}
+			}
+		}()
+	})
+}
+
+// evictStale closes and removes cached entries whose lastUsed exceeded
+// maxIdle. Called by the janitor on a timer; safe to call from anywhere.
+func (m *Manager) evictStale() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	for id, e := range m.entries {
+		if now.Sub(e.lastUsed) > maxIdle {
+			m.log.Info("mcp evicting idle entry",
+				zap.String("server_id", id),
+				zap.Duration("idle", now.Sub(e.lastUsed)))
+			closeEntry(m.log, id, e)
+			delete(m.entries, id)
+		}
 	}
 }
 
-// Shutdown closes every cached connection. Safe to call multiple times.
+// Shutdown closes every cached connection and stops the janitor.
+// Safe to call multiple times (sync.Once guards the channel close; the
+// entry-teardown loop is naturally idempotent because we reset the map at
+// the end).
 func (m *Manager) Shutdown() {
+	// Signal the janitor first so it can't race with the entry teardown
+	// below. Guarding with sync.Once is the only race-free way to make a
+	// channel close idempotent — the select+default pattern has a TOCTOU
+	// window where two concurrent shutdowns can both observe "not yet
+	// closed" and both call close(), panicking the second one.
+	m.janitorStopOnce.Do(func() { close(m.janitorStop) })
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for id, e := range m.entries {
