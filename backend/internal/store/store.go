@@ -11,8 +11,8 @@ import (
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 
-	"github.com/wzyjerry/opentheone/backend/internal/config"
-	"github.com/wzyjerry/opentheone/backend/internal/model"
+	"github.com/opentheone/opentheone/backend/internal/config"
+	"github.com/opentheone/opentheone/backend/internal/model"
 )
 
 // sqliteDSN attaches the recommended pragmas (WAL journal, busy timeout, FKs)

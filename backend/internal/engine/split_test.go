@@ -5,7 +5,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/wzyjerry/opentheone/backend/internal/ilink"
+	"github.com/opentheone/opentheone/backend/internal/ilink"
 )
 
 func TestSplitForWeChat_NoSplitWhenShort(t *testing.T) {

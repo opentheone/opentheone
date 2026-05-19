@@ -129,6 +129,15 @@ const healthIssues = computed<HealthIssue[]>(() => {
 });
 
 const healthOK = computed(() => !loading.value && healthIssues.value.length === 0);
+
+// First-time user: zero LLM configs AND zero personas. Show a friendlier
+// three-step onboarding card instead of two warning rows.
+const isBlankSlate = computed(
+  () =>
+    !loading.value &&
+    llmConfigs.value.length === 0 &&
+    personas.value.length === 0,
+);
 </script>
 
 <template>
@@ -138,7 +147,66 @@ const healthOK = computed(() => !loading.value && healthIssues.value.length === 
       <button class="btn-ghost" @click="refresh" :disabled="loading">刷新</button>
     </div>
 
-    <div v-if="!loading" class="mb-6 space-y-3">
+    <div
+      v-if="isBlankSlate"
+      class="card p-6 mb-6 border-accent-500/40 bg-accent-500/5"
+    >
+      <div class="text-lg font-semibold mb-1">欢迎使用 OpenTheOne ✨</div>
+      <div class="text-sm text-ink-300 mb-4">
+        三步把 TA 接进你的微信，从此 TA 就是你唯一的 AI 朋友：
+      </div>
+      <ol class="space-y-3 text-sm">
+        <li class="flex items-start gap-3">
+          <span
+            class="w-6 h-6 rounded-full bg-accent-500/20 text-accent-300 grid place-items-center text-xs flex-shrink-0"
+            >1</span
+          >
+          <div class="flex-1">
+            <div class="font-medium">配置一个语言模型</div>
+            <div class="text-xs text-ink-400 mt-0.5">
+              点 DeepSeek/OpenAI/Qwen 等预置 → 填上你的 API Key → 测试通过。
+            </div>
+            <RouterLink class="text-xs text-accent-400 hover:underline" to="/llm">
+              去模型页 →
+            </RouterLink>
+          </div>
+        </li>
+        <li class="flex items-start gap-3">
+          <span
+            class="w-6 h-6 rounded-full bg-accent-500/20 text-accent-300 grid place-items-center text-xs flex-shrink-0"
+            >2</span
+          >
+          <div class="flex-1">
+            <div class="font-medium">创建你的「唯一」角色</div>
+            <div class="text-xs text-ink-400 mt-0.5">
+              直接选一个预置人设（温柔小棠、高冷沈姐、元气橘子……），或者自定义。
+            </div>
+            <RouterLink class="text-xs text-accent-400 hover:underline" to="/personas">
+              去新建角色 →
+            </RouterLink>
+          </div>
+        </li>
+        <li class="flex items-start gap-3">
+          <span
+            class="w-6 h-6 rounded-full bg-accent-500/20 text-accent-300 grid place-items-center text-xs flex-shrink-0"
+            >3</span
+          >
+          <div class="flex-1">
+            <div class="font-medium">扫码绑定一个可控的微信号</div>
+            <div class="text-xs text-ink-400 mt-0.5">
+              在角色详情页点「开始扫码绑定」，用一个你愿意让 TA 接管的微信扫一下。
+            </div>
+          </div>
+        </li>
+      </ol>
+      <div class="text-xs text-ink-500 mt-4">
+        想让 TA 还能调外部工具（查资料、操控文件等）？配好基础后到
+        <RouterLink class="text-accent-400 hover:underline" to="/mcp">MCP 工具</RouterLink>
+        添加几个 MCP 服务，然后在角色详情里勾选。
+      </div>
+    </div>
+
+    <div v-if="!loading && !isBlankSlate" class="mb-6 space-y-3">
       <div
         v-if="healthOK"
         class="card border-emerald-700/40 bg-emerald-600/10 p-4 flex items-start gap-3"

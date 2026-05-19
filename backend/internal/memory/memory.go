@@ -13,8 +13,8 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/wzyjerry/opentheone/backend/internal/llm"
-	"github.com/wzyjerry/opentheone/backend/internal/model"
+	"github.com/opentheone/opentheone/backend/internal/llm"
+	"github.com/opentheone/opentheone/backend/internal/model"
 )
 
 // Service is the long-term memory layer (extract / dedupe / retrieve).

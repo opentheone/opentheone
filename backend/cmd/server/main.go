@@ -13,17 +13,18 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/wzyjerry/opentheone/backend/internal/auth"
-	"github.com/wzyjerry/opentheone/backend/internal/config"
-	"github.com/wzyjerry/opentheone/backend/internal/engine"
-	"github.com/wzyjerry/opentheone/backend/internal/ilink"
-	"github.com/wzyjerry/opentheone/backend/internal/logger"
-	"github.com/wzyjerry/opentheone/backend/internal/memory"
-	"github.com/wzyjerry/opentheone/backend/internal/proactive"
-	"github.com/wzyjerry/opentheone/backend/internal/runner"
-	"github.com/wzyjerry/opentheone/backend/internal/server"
-	"github.com/wzyjerry/opentheone/backend/internal/settings"
-	"github.com/wzyjerry/opentheone/backend/internal/store"
+	"github.com/opentheone/opentheone/backend/internal/auth"
+	"github.com/opentheone/opentheone/backend/internal/config"
+	"github.com/opentheone/opentheone/backend/internal/engine"
+	"github.com/opentheone/opentheone/backend/internal/ilink"
+	"github.com/opentheone/opentheone/backend/internal/logger"
+	"github.com/opentheone/opentheone/backend/internal/mcp"
+	"github.com/opentheone/opentheone/backend/internal/memory"
+	"github.com/opentheone/opentheone/backend/internal/proactive"
+	"github.com/opentheone/opentheone/backend/internal/runner"
+	"github.com/opentheone/opentheone/backend/internal/server"
+	"github.com/opentheone/opentheone/backend/internal/settings"
+	"github.com/opentheone/opentheone/backend/internal/store"
 )
 
 // These are populated at build time via -ldflags; see Makefile / Dockerfile.
@@ -106,7 +107,8 @@ func main() {
 	})
 
 	memSvc := memory.NewService(db)
-	eng := engine.NewEngine(db, ilinkClient, memSvc, log, engine.Options{
+	mcpMgr := mcp.NewManager(log)
+	eng := engine.NewEngine(db, ilinkClient, memSvc, mcpMgr, log, engine.Options{
 		Secret:         cfg.Auth.JWTSecret,
 		MaxChunk:       1800,
 		HistoryN:       16,
@@ -138,6 +140,7 @@ func main() {
 		Manager:   mgr,
 		QRLogin:   qrlog,
 		Settings:  settingsSvc,
+		MCP:       mcpMgr,
 		Logger:    log,
 		Version:   Version,
 		Commit:    Commit,
@@ -164,6 +167,7 @@ func main() {
 
 	rootCancel()
 	mgr.StopAll()
+	mcpMgr.Shutdown()
 	sched.Stop()
 	if err := server.Shutdown(srv, 5*time.Second); err != nil {
 		log.Error("graceful shutdown", zap.Error(err))

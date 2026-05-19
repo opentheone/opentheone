@@ -3,22 +3,26 @@
 #
 # Every PR is auto-requested for review by the listed owners. The last matching
 # pattern wins, so put more specific rules below more general ones.
+#
+# We point at the org-level @opentheone/maintainers team so reviewer routing
+# survives membership changes; create the team in the GitHub org settings
+# before merging this file or CODEOWNERS will silently no-op.
 
-# Default: everything goes to the project lead.
-*                                       @wzyjerry
+# Default: everything goes to the maintainers team.
+*                                       @opentheone/maintainers
 
 # CI / release infra needs an extra pair of eyes — easy to break silently.
-/.github/                               @wzyjerry
-/Dockerfile                             @wzyjerry
-/docker-compose.yml                     @wzyjerry
-/Makefile                               @wzyjerry
+/.github/                               @opentheone/maintainers
+/Dockerfile                             @opentheone/maintainers
+/docker-compose.yml                     @opentheone/maintainers
+/Makefile                               @opentheone/maintainers
 
 # Security-sensitive surfaces.
-/backend/internal/auth/                 @wzyjerry
-/backend/internal/crypto/               @wzyjerry
-/backend/internal/middleware/           @wzyjerry
-/SECURITY.md                            @wzyjerry
+/backend/internal/auth/                 @opentheone/maintainers
+/backend/internal/crypto/               @opentheone/maintainers
+/backend/internal/middleware/           @opentheone/maintainers
+/SECURITY.md                            @opentheone/maintainers
 
 # Protocol layer: any change here must be cross-checked against the official
 # Tencent ClawBot / iLink docs.
-/backend/internal/ilink/                @wzyjerry
+/backend/internal/ilink/                @opentheone/maintainers

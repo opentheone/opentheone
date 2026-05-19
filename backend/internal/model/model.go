@@ -59,6 +59,10 @@ type Persona struct {
 	ProactivePrompt string `gorm:"type:text" json:"proactive_prompt"`
 	IsActive        bool   `gorm:"default:false" json:"is_active"`
 	LLMConfigID     string `gorm:"size:36" json:"llm_config_id"`
+	// EnabledMCPIDs is a JSON-encoded []string of MCPServer IDs this persona
+	// is allowed to use as agent tools during chat. Empty string == no MCP
+	// tools enabled (chat falls back to plain LLM completion, no agent loop).
+	EnabledMCPIDs string `gorm:"type:text" json:"enabled_mcp_ids"`
 }
 
 // WeChatBinding stores ClawBot/iLink credentials and runtime cursor for a persona.
@@ -108,19 +112,38 @@ type Conversation struct {
 	SummaryUpdatedAt      time.Time `json:"summary_updated_at"`
 }
 
-// Message stores both inbound and outbound messages.
+// Message stores both inbound and outbound messages, plus the auxiliary
+// agent-loop bookkeeping rows ("tool_call" + "tool_result") so the user can
+// audit what the AI did under the hood in the conversation detail view.
+//
+// Direction values:
+//   - "inbound" / "outbound": real WeChat messages.
+//   - "tool_call": the assistant decided to call an MCP tool. ToolName +
+//     ToolCallID + ToolArgs describe the request; Text is empty.
+//   - "tool_result": the MCP tool's response (possibly truncated). ToolName +
+//     ToolCallID match the corresponding tool_call row; Text is empty;
+//     ToolResult holds the rendered content.
+//
+// These two new directions are *not* sent over iLink, never carry a
+// context_token, and never participate in the rolling summary or
+// long-term memory ingestion. They're purely UI/audit rows.
 type Message struct {
 	BaseModel
 	ConversationID string `gorm:"index;size:36;not null" json:"conversation_id"`
-	Direction      string `gorm:"size:16;not null" json:"direction"` // inbound / outbound
+	Direction      string `gorm:"size:16;not null" json:"direction"` // inbound / outbound / tool_call / tool_result
 	ILinkMessageID int64  `gorm:"index" json:"ilink_message_id"`
 	ClientID       string `gorm:"size:128" json:"client_id"`
 	ContextToken   string `gorm:"type:text" json:"-"`
-	Type           string `gorm:"size:16;default:text" json:"type"` // text/image/voice/file/video
+	Type           string `gorm:"size:16;default:text" json:"type"` // text/image/voice/file/video/tool
 	Text           string `gorm:"type:text" json:"text"`
 	MediaURL       string `gorm:"size:255" json:"media_url"`
 	Extra          string `gorm:"type:text" json:"extra"`
 	Status         string `gorm:"size:16;default:received" json:"status"`
+	// Agent-loop fields (only set for direction in tool_call / tool_result):
+	ToolName   string `gorm:"size:128" json:"tool_name,omitempty"`
+	ToolCallID string `gorm:"size:128" json:"tool_call_id,omitempty"`
+	ToolArgs   string `gorm:"type:text" json:"tool_args,omitempty"`
+	ToolResult string `gorm:"type:text" json:"tool_result,omitempty"`
 }
 
 // Memory is one long-term memory fragment for a persona.
@@ -145,6 +168,35 @@ type Attachment struct {
 	Mime      string `gorm:"size:64" json:"mime"`
 }
 
+// MCPServer is one user-configured Model Context Protocol server.
+// Two transports are supported:
+//   - "stdio": local subprocess, fields Command/Args/Env are used.
+//   - "streamable_http": remote HTTP(S) endpoint per the MCP 2025-03-26 spec,
+//     fields URL/Headers are used.
+//
+// Args/Env/Headers are JSON-encoded for portability across drivers (sqlite
+// has no native array column).
+type MCPServer struct {
+	BaseModel
+	UserID      string `gorm:"index;size:36;not null" json:"user_id"`
+	Name        string `gorm:"size:64;not null" json:"name"`
+	Description string `gorm:"type:text" json:"description"`
+	// Transport: "stdio" or "streamable_http".
+	Transport string `gorm:"size:32;not null;default:stdio" json:"transport"`
+	// stdio fields:
+	Command string `gorm:"size:255" json:"command"`
+	Args    string `gorm:"type:text" json:"args"` // JSON []string
+	Env     string `gorm:"type:text" json:"env"`  // JSON map[string]string
+	// streamable_http fields:
+	URL     string `gorm:"size:512" json:"url"`
+	Headers string `gorm:"type:text" json:"headers"` // JSON map[string]string
+	// Enabled is a global on/off; even if a persona references it, a disabled
+	// server is skipped during tool discovery.
+	Enabled bool `gorm:"default:true" json:"enabled"`
+	// TimeoutMs caps a single tool invocation. 0 falls back to a 30s default.
+	TimeoutMs int `gorm:"default:30000" json:"timeout_ms"`
+}
+
 // SystemSetting is a key-value row for runtime-mutable global settings.
 // Seeded on first start from config.yaml, mutable by admins via /api/admin/settings.
 type SystemSetting struct {
@@ -165,5 +217,6 @@ func AllModels() []interface{} {
 		&Memory{},
 		&Attachment{},
 		&SystemSetting{},
+		&MCPServer{},
 	}
 }

@@ -5,7 +5,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/wzyjerry/opentheone/backend/internal/middleware"
+	"github.com/opentheone/opentheone/backend/internal/middleware"
 )
 
 func ok(c *gin.Context, data interface{}) {

@@ -10,15 +10,16 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
-	"github.com/wzyjerry/opentheone/backend/internal/auth"
-	"github.com/wzyjerry/opentheone/backend/internal/config"
-	"github.com/wzyjerry/opentheone/backend/internal/engine"
-	"github.com/wzyjerry/opentheone/backend/internal/handler"
-	"github.com/wzyjerry/opentheone/backend/internal/memory"
-	"github.com/wzyjerry/opentheone/backend/internal/middleware"
-	"github.com/wzyjerry/opentheone/backend/internal/runner"
-	"github.com/wzyjerry/opentheone/backend/internal/settings"
-	"github.com/wzyjerry/opentheone/backend/internal/web"
+	"github.com/opentheone/opentheone/backend/internal/auth"
+	"github.com/opentheone/opentheone/backend/internal/config"
+	"github.com/opentheone/opentheone/backend/internal/engine"
+	"github.com/opentheone/opentheone/backend/internal/handler"
+	"github.com/opentheone/opentheone/backend/internal/mcp"
+	"github.com/opentheone/opentheone/backend/internal/memory"
+	"github.com/opentheone/opentheone/backend/internal/middleware"
+	"github.com/opentheone/opentheone/backend/internal/runner"
+	"github.com/opentheone/opentheone/backend/internal/settings"
+	"github.com/opentheone/opentheone/backend/internal/web"
 )
 
 // Deps bundles the wired collaborators that Build needs to mount HTTP routes.
@@ -31,6 +32,7 @@ type Deps struct {
 	Manager   *runner.Manager
 	QRLogin   *runner.QRLoginCoordinator
 	Settings  *settings.Service
+	MCP       *mcp.Manager
 	Logger    *zap.Logger
 	Version   string
 	Commit    string
@@ -86,6 +88,7 @@ func Build(deps Deps) *http.Server {
 			ph := handler.NewPersonaHandler(deps.DB, deps.Manager, deps.Engine)
 			authed.POST("/persona/create", ph.Create)
 			authed.POST("/persona/list", ph.List)
+			authed.POST("/persona/templates", ph.Templates)
 			authed.POST("/persona/get", ph.Get)
 			authed.POST("/persona/update", ph.Update)
 			authed.POST("/persona/delete", ph.Delete)
@@ -117,10 +120,19 @@ func Build(deps Deps) *http.Server {
 			authed.POST("/memory/delete", mh.Delete)
 			authed.POST("/memory/upsert_manual", mh.UpsertManual)
 
+			mcph := handler.NewMCPHandler(deps.DB, deps.MCP)
+			authed.POST("/mcp/create", mcph.Create)
+			authed.POST("/mcp/list", mcph.List)
+			authed.POST("/mcp/update", mcph.Update)
+			authed.POST("/mcp/delete", mcph.Delete)
+			authed.POST("/mcp/test", mcph.Test)
+			authed.POST("/mcp/tools", mcph.Tools)
+			authed.POST("/mcp/import", mcph.Import)
+
 			admin := authed.Group("/admin")
 			admin.Use(middleware.AdminOnly())
 			{
-				adminH := handler.NewAdminHandler(deps.DB, deps.Settings, deps.Manager)
+				adminH := handler.NewAdminHandler(deps.DB, deps.Settings, deps.Manager, deps.MCP)
 				admin.POST("/users", adminH.ListUsers)
 				admin.POST("/users/set_role", adminH.SetRole)
 				admin.POST("/users/reset_password", adminH.ResetPassword)

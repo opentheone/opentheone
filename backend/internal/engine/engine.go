@@ -13,11 +13,12 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
-	"github.com/wzyjerry/opentheone/backend/internal/crypto"
-	"github.com/wzyjerry/opentheone/backend/internal/ilink"
-	"github.com/wzyjerry/opentheone/backend/internal/llm"
-	"github.com/wzyjerry/opentheone/backend/internal/memory"
-	"github.com/wzyjerry/opentheone/backend/internal/model"
+	"github.com/opentheone/opentheone/backend/internal/crypto"
+	"github.com/opentheone/opentheone/backend/internal/ilink"
+	"github.com/opentheone/opentheone/backend/internal/llm"
+	"github.com/opentheone/opentheone/backend/internal/mcp"
+	"github.com/opentheone/opentheone/backend/internal/memory"
+	"github.com/opentheone/opentheone/backend/internal/model"
 )
 
 // Engine glues conversation persistence, LLM generation, and iLink sending.
@@ -25,6 +26,7 @@ type Engine struct {
 	db             *gorm.DB
 	ilink          *ilink.Client
 	mem            *memory.Service
+	mcp            *mcp.Manager
 	log            *zap.Logger
 	secret         string // for decrypting LLMConfig.APIKeyEnc
 	maxChunk       int    // max chars per outbound sendmessage
@@ -33,6 +35,10 @@ type Engine struct {
 	summaryEvery   int    // trigger rolling summary once unsummarized msgs exceed historyN + summaryEvery
 	summaryTarget  int    // approx target char length for the rolling summary
 	attachmentsDir string // where inbound media files are saved
+	// agentMaxSteps caps how many tool-call rounds the agent loop will run
+	// before falling back to whatever text the LLM produced. Guards against
+	// runaway loops where the model keeps re-calling the same tool.
+	agentMaxSteps int
 }
 
 type Options struct {
@@ -43,9 +49,10 @@ type Options struct {
 	SummaryEvery   int
 	SummaryTarget  int
 	AttachmentsDir string
+	AgentMaxSteps  int
 }
 
-func NewEngine(db *gorm.DB, ilinkClient *ilink.Client, mem *memory.Service, log *zap.Logger, opts Options) *Engine {
+func NewEngine(db *gorm.DB, ilinkClient *ilink.Client, mem *memory.Service, mcpMgr *mcp.Manager, log *zap.Logger, opts Options) *Engine {
 	if opts.MaxChunk <= 0 {
 		opts.MaxChunk = 1800
 	}
@@ -61,10 +68,14 @@ func NewEngine(db *gorm.DB, ilinkClient *ilink.Client, mem *memory.Service, log 
 	if opts.SummaryTarget <= 0 {
 		opts.SummaryTarget = 600
 	}
+	if opts.AgentMaxSteps <= 0 {
+		opts.AgentMaxSteps = 6
+	}
 	return &Engine{
 		db:             db,
 		ilink:          ilinkClient,
 		mem:            mem,
+		mcp:            mcpMgr,
 		log:            log,
 		secret:         opts.Secret,
 		maxChunk:       opts.MaxChunk,
@@ -73,6 +84,7 @@ func NewEngine(db *gorm.DB, ilinkClient *ilink.Client, mem *memory.Service, log 
 		summaryEvery:   opts.SummaryEvery,
 		summaryTarget:  opts.SummaryTarget,
 		attachmentsDir: opts.AttachmentsDir,
+		agentMaxSteps:  opts.AgentMaxSteps,
 	}
 }
 
@@ -243,23 +255,16 @@ func (e *Engine) HandleInbound(ctx context.Context, binding *model.WeChatBinding
 	}
 	llmClient := llm.NewClient(llmCfg, apiKey)
 
-	reply, err := e.generateReply(ctx, persona, conv, llmClient, text)
-	if err != nil {
-		e.log.Error("generate reply failed", zap.Error(err))
-		return err
-	}
-	reply = strings.TrimSpace(reply)
-	if reply == "" {
-		return nil
-	}
-
+	// Build the iLink session early so we can start the "正在输入" indicator
+	// BEFORE the LLM (and any MCP tool calls) start. With the agent loop a
+	// turn can easily take 5-15s; without an early typing signal the peer
+	// just sees silence.
 	sess := ilink.Session{
 		BotToken:    binding.BotToken,
 		BaseURL:     binding.BaseURL,
 		ILinkBotID:  binding.ILinkBotID,
 		ILinkUserID: binding.ILinkUserID,
 	}
-
 	typingTicket := e.ensureTypingTicket(ctx, binding, sess, msg.FromUserID, msg.ContextToken)
 	if typingTicket != "" {
 		_ = e.ilink.SendTyping(ctx, sess, msg.FromUserID, typingTicket, 1)
@@ -271,6 +276,18 @@ func (e *Engine) HandleInbound(ctx context.Context, binding *model.WeChatBinding
 			defer cancel()
 			_ = e.ilink.SendTyping(stopCtx, sess, msg.FromUserID, typingTicket, 2)
 		}
+	}
+
+	reply, err := e.generateReply(ctx, persona, conv, llmClient, text)
+	if err != nil {
+		stopTyping()
+		e.log.Error("generate reply failed", zap.Error(err))
+		return err
+	}
+	reply = strings.TrimSpace(reply)
+	if reply == "" {
+		stopTyping()
+		return nil
 	}
 
 	chunks := splitForWeChat(reply, e.maxChunk)
@@ -339,7 +356,20 @@ func (e *Engine) HandleInbound(ctx context.Context, binding *model.WeChatBinding
 	return nil
 }
 
-// generateReply builds the prompt and calls the LLM.
+// generateReply builds the prompt and runs the agent loop.
+//
+// Agent loop overview:
+//  1. Build a chat history (system + summary + memory + recent turns).
+//  2. Load the persona's enabled MCP tools (if any).
+//  3. Streaming chat-completion call with the tool list.
+//  4. If the model returns tool_calls instead of (or in addition to) text:
+//     execute each call via the MCP registry, append tool result messages,
+//     loop. Otherwise return the text.
+//  5. Bounded by agentMaxSteps so a misbehaving model can't loop forever.
+//
+// When no MCP servers are enabled we keep the original (non-streaming,
+// no-tools) Chat() path; it's slightly cheaper and bypasses the streaming
+// machinery for providers that don't speak it perfectly.
 func (e *Engine) generateReply(ctx context.Context, persona *model.Persona, conv *model.Conversation, llmClient *llm.Client, userText string) (string, error) {
 	var prior int64
 	_ = e.db.WithContext(ctx).Model(&model.Message{}).
@@ -374,8 +404,13 @@ func (e *Engine) generateReply(ctx context.Context, persona *model.Persona, conv
 		}
 	}
 
-	// 3) Recent verbatim history — only messages newer than the summary watermark.
-	q := e.db.WithContext(ctx).Where("conversation_id = ?", conv.ID)
+	// 3) Recent verbatim history — only real inbound/outbound messages newer
+	// than the summary watermark. We deliberately exclude the agent-loop
+	// audit rows (tool_call / tool_result) here: they're persisted for the
+	// user's debugging, not for re-feeding into a fresh LLM turn (the live
+	// agent loop maintains its own in-memory tool-call history).
+	q := e.db.WithContext(ctx).
+		Where("conversation_id = ? AND direction IN ?", conv.ID, []string{"inbound", "outbound"})
 	if !conv.SummaryUpdatedAt.IsZero() {
 		q = q.Where("created_at > ?", conv.SummaryUpdatedAt)
 	}
@@ -396,11 +431,193 @@ func (e *Engine) generateReply(ctx context.Context, persona *model.Persona, conv
 		}
 	}
 
-	reply, err := llmClient.Chat(ctx, msgs)
-	if err != nil {
-		return "", err
+	// 4) Load MCP tools for this persona (may be empty).
+	var registry *mcp.Registry
+	if e.mcp != nil {
+		registry = mcp.LoadForPersona(ctx, e.db, e.mcp, e.log, persona)
 	}
-	return reply, nil
+	// Fast path: no tools available → original non-streaming chat completion.
+	if registry == nil || registry.Empty() {
+		return llmClient.Chat(ctx, msgs)
+	}
+
+	// Tools available: append a brief usage hint, then run the agent loop.
+	tools := registry.Tools()
+	msgs = append([]llm.ChatMessage{msgs[0], {
+		Role: "system",
+		Content: "你可以调用下面这些工具来帮助回答（仅在你认为有用时才调用）。" +
+			"每次工具返回后，请用自然口语化的方式融合到回复里，不要把工具结果原样贴出。" +
+			"工具调用是后台行为，对方看不到。",
+	}}, msgs[1:]...)
+
+	return e.runAgentLoop(ctx, conv, llmClient, registry, tools, msgs)
+}
+
+// runAgentLoop drives the assistant → tool_calls → tool_results loop until
+// the model produces a final text reply (or we hit the step cap).
+//
+// Implementation notes:
+//   - We feed the LLM the FULL history including its own assistant-with-tool-
+//     calls messages, then the corresponding tool result messages. OpenAI
+//     rejects orphan tool messages (no matching assistant.tool_calls), so we
+//     always append both halves together.
+//   - A tool that errors out is still reported back to the model as a "tool"
+//     message with the error string, so the model can choose to retry or
+//     apologize to the user. We do NOT abort the loop on a tool failure.
+//   - If we exhaust agentMaxSteps with no text reply, we return a polite
+//     fallback so the user isn't ghosted.
+func (e *Engine) runAgentLoop(
+	ctx context.Context,
+	conv *model.Conversation,
+	llmClient *llm.Client,
+	registry *mcp.Registry,
+	tools []mcp.LLMTool,
+	msgs []llm.ChatMessage,
+) (string, error) {
+	llmTools := make([]llm.Tool, 0, len(tools))
+	for _, t := range tools {
+		llmTools = append(llmTools, llm.Tool{
+			Name:        t.Name,
+			Description: t.Description,
+			Parameters:  t.Parameters,
+		})
+	}
+
+	var lastContent string
+	for step := 0; step < e.agentMaxSteps; step++ {
+		turn, err := llmClient.ChatWithTools(ctx, msgs, llmTools)
+		if err != nil {
+			return "", fmt.Errorf("agent step %d: %w", step, err)
+		}
+		if strings.TrimSpace(turn.Content) != "" {
+			lastContent = turn.Content
+		}
+
+		// If the model didn't ask for tools, we're done.
+		if len(turn.ToolCalls) == 0 {
+			return turn.Content, nil
+		}
+
+		e.log.Debug("agent step requested tool calls",
+			zap.Int("step", step),
+			zap.Int("calls", len(turn.ToolCalls)),
+			zap.String("finish_reason", turn.FinishReason))
+
+		// Persist the assistant-with-tool-calls turn into the running history
+		// so the model sees its own prior decision next round.
+		msgs = append(msgs, llm.ChatMessage{
+			Role:      "assistant",
+			Content:   turn.Content,
+			ToolCalls: turn.ToolCalls,
+		})
+
+		// Execute each tool call sequentially. Parallel is possible but
+		// makes error attribution harder and most MCP servers we expect
+		// are local stdio (no real network parallelism benefit).
+		for _, call := range turn.ToolCalls {
+			// Persist the agent's *decision* row (tool_call). Failure is
+			// best-effort; an audit-row write should never block actual
+			// tool execution.
+			e.persistToolCallRow(ctx, conv, call)
+
+			args := map[string]any{}
+			if call.Arguments != "" {
+				if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
+					// Bad JSON from the model: report back as a tool error
+					// so the next round can self-correct.
+					errMsg := fmt.Sprintf("error: arguments JSON parse failed: %v", err)
+					e.persistToolResultRow(ctx, conv, call, errMsg, "failed")
+					msgs = append(msgs, llm.ChatMessage{
+						Role:       "tool",
+						ToolCallID: call.ID,
+						Content:    errMsg,
+					})
+					continue
+				}
+			}
+			result, isErr, err := registry.Invoke(ctx, call.Name, args)
+			content := result
+			status := "ok"
+			switch {
+			case err != nil:
+				content = "error: " + err.Error()
+				status = "failed"
+				e.log.Warn("tool invoke failed",
+					zap.String("tool", call.Name),
+					zap.Error(err))
+			case isErr:
+				if content == "" {
+					content = "(tool reported error)"
+				}
+				status = "failed"
+			case content == "":
+				content = "(tool returned no content)"
+			}
+			e.persistToolResultRow(ctx, conv, call, content, status)
+			msgs = append(msgs, llm.ChatMessage{
+				Role:       "tool",
+				ToolCallID: call.ID,
+				Content:    content,
+			})
+		}
+	}
+
+	// Step budget exhausted. Prefer the last bit of text the model produced
+	// (even if it was alongside another tool call), so the user gets *some*
+	// answer instead of a canned apology.
+	if strings.TrimSpace(lastContent) != "" {
+		return lastContent, nil
+	}
+	e.log.Warn("agent loop hit step cap without final reply",
+		zap.Int("max_steps", e.agentMaxSteps))
+	return "（抱歉，我刚刚卡住了，过会儿再聊好吗？）", nil
+}
+
+// persistToolCallRow writes a "tool_call" audit message into the conversation
+// so the user can see what the AI decided to invoke. Best-effort: errors are
+// logged but never block the agent loop.
+func (e *Engine) persistToolCallRow(ctx context.Context, conv *model.Conversation, call llm.ToolCall) {
+	if conv == nil {
+		return
+	}
+	row := model.Message{
+		ConversationID: conv.ID,
+		Direction:      "tool_call",
+		Type:           "tool",
+		Status:         "ok",
+		ToolName:       call.Name,
+		ToolCallID:     call.ID,
+		ToolArgs:       call.Arguments,
+	}
+	if err := e.db.WithContext(ctx).Create(&row).Error; err != nil {
+		e.log.Warn("persist tool_call row failed",
+			zap.String("tool", call.Name),
+			zap.Error(err))
+	}
+}
+
+// persistToolResultRow writes a "tool_result" audit message paired with the
+// previous tool_call (joined by ToolCallID). content is the rendered tool
+// output (already truncated by mcp.renderResult upstream); status is "ok"
+// or "failed".
+func (e *Engine) persistToolResultRow(ctx context.Context, conv *model.Conversation, call llm.ToolCall, content, status string) {
+	if conv == nil {
+		return
+	}
+	row := model.Message{
+		ConversationID: conv.ID,
+		Direction:      "tool_result",
+		Type:           "tool",
+		Status:         status,
+		ToolName:       call.Name,
+		ToolCallID:     call.ID,
+		ToolResult:     content,
+	}
+	if err := e.db.WithContext(ctx).Create(&row).Error; err != nil {
+		e.log.Warn("persist tool_result row failed",
+			zap.String("tool", call.Name),
+			zap.Error(err))
+	}
 }
 
 func buildSystemPrompt(p *model.Persona, firstInteraction bool) string {

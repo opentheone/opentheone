@@ -99,7 +99,7 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/wzyjerry/opentheone
+        - github.com/opentheone/opentheone
 
 issues:
   max-issues-per-linter: 0

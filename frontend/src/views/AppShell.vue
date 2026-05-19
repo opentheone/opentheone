@@ -12,6 +12,7 @@ const nav = computed(() => {
     { to: "/personas", label: "角色" },
     { to: "/conversations", label: "对话" },
     { to: "/llm", label: "模型" },
+    { to: "/mcp", label: "MCP 工具" },
     { to: "/settings", label: "设置" },
   ];
   if (auth.user?.role === "admin") {

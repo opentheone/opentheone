@@ -10,8 +10,8 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/wzyjerry/opentheone/backend/internal/ilink"
-	"github.com/wzyjerry/opentheone/backend/internal/model"
+	"github.com/opentheone/opentheone/backend/internal/ilink"
+	"github.com/opentheone/opentheone/backend/internal/model"
 )
 
 // downloadIfNeeded best-effort downloads & decrypts inbound media for one MessageItem.

@@ -9,9 +9,9 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/wzyjerry/opentheone/backend/internal/crypto"
-	"github.com/wzyjerry/opentheone/backend/internal/llm"
-	"github.com/wzyjerry/opentheone/backend/internal/model"
+	"github.com/opentheone/opentheone/backend/internal/crypto"
+	"github.com/opentheone/opentheone/backend/internal/llm"
+	"github.com/opentheone/opentheone/backend/internal/model"
 )
 
 // summarizeLocks holds one mutex per conversation_id so that concurrent
@@ -91,9 +91,12 @@ func (e *Engine) MaybeSummarize(ctx context.Context, conv *model.Conversation, l
 	conv.SummaryUntilMessageID = fresh.SummaryUntilMessageID
 	conv.SummaryUpdatedAt = fresh.SummaryUpdatedAt
 
+	// Count only real conversational messages (skip agent-loop audit rows),
+	// otherwise a single chat turn with 5 tool calls would prematurely trip
+	// the threshold.
 	q := e.db.WithContext(ctx).
 		Model(&model.Message{}).
-		Where("conversation_id = ?", conv.ID)
+		Where("conversation_id = ? AND direction IN ?", conv.ID, []string{"inbound", "outbound"})
 	if !conv.SummaryUpdatedAt.IsZero() {
 		q = q.Where("created_at > ?", conv.SummaryUpdatedAt)
 	}
@@ -116,7 +119,7 @@ func (e *Engine) MaybeSummarize(ctx context.Context, conv *model.Conversation, l
 	}
 
 	mq := e.db.WithContext(ctx).
-		Where("conversation_id = ?", conv.ID)
+		Where("conversation_id = ? AND direction IN ?", conv.ID, []string{"inbound", "outbound"})
 	if !conv.SummaryUpdatedAt.IsZero() {
 		mq = mq.Where("created_at > ?", conv.SummaryUpdatedAt)
 	}
@@ -196,7 +199,7 @@ func (e *Engine) RebuildSummary(ctx context.Context, conv *model.Conversation, l
 
 	var msgs []model.Message
 	if err := e.db.WithContext(ctx).
-		Where("conversation_id = ?", conv.ID).
+		Where("conversation_id = ? AND direction IN ?", conv.ID, []string{"inbound", "outbound"}).
 		Order("created_at asc").
 		Find(&msgs).Error; err != nil {
 		return err

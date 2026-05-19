@@ -9,8 +9,8 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
-	"github.com/wzyjerry/opentheone/backend/internal/ilink"
-	"github.com/wzyjerry/opentheone/backend/internal/model"
+	"github.com/opentheone/opentheone/backend/internal/ilink"
+	"github.com/opentheone/opentheone/backend/internal/model"
 )
 
 // QRLoginCoordinator drives QR scan polling in the background per binding.

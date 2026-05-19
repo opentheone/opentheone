@@ -7,10 +7,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
-	"github.com/wzyjerry/opentheone/backend/internal/crypto"
-	"github.com/wzyjerry/opentheone/backend/internal/llm"
-	"github.com/wzyjerry/opentheone/backend/internal/memory"
-	"github.com/wzyjerry/opentheone/backend/internal/model"
+	"github.com/opentheone/opentheone/backend/internal/crypto"
+	"github.com/opentheone/opentheone/backend/internal/llm"
+	"github.com/opentheone/opentheone/backend/internal/memory"
+	"github.com/opentheone/opentheone/backend/internal/model"
 )
 
 type MemoryHandler struct {

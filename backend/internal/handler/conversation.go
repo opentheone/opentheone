@@ -11,8 +11,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
-	"github.com/wzyjerry/opentheone/backend/internal/engine"
-	"github.com/wzyjerry/opentheone/backend/internal/model"
+	"github.com/opentheone/opentheone/backend/internal/engine"
+	"github.com/opentheone/opentheone/backend/internal/model"
 )
 
 type ConversationHandler struct {
@@ -230,6 +230,8 @@ func (h *ConversationHandler) Export(c *gin.Context) {
 		fail(c, http.StatusNotFound, 404, "not found")
 		return
 	}
+	// Export the readable transcript: skip agent-loop audit rows. JSON export
+	// is intentionally raw (includes tool rows) so power users can grep them.
 	var rows []model.Message
 	if err := h.db.Where("conversation_id = ?", req.ConversationID).
 		Order("created_at asc").Find(&rows).Error; err != nil {
@@ -240,6 +242,9 @@ func (h *ConversationHandler) Export(c *gin.Context) {
 	case "markdown", "md":
 		var b strings.Builder
 		for _, m := range rows {
+			if m.Direction != "inbound" && m.Direction != "outbound" {
+				continue
+			}
 			role := "User"
 			if m.Direction == "outbound" {
 				role = "AI"

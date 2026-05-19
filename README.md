@@ -1,8 +1,8 @@
 # OpenTheOne
 
-[![CI](https://github.com/wzyjerry/opentheone/actions/workflows/ci.yml/badge.svg)](https://github.com/wzyjerry/opentheone/actions/workflows/ci.yml)
-[![CodeQL](https://github.com/wzyjerry/opentheone/actions/workflows/codeql.yml/badge.svg)](https://github.com/wzyjerry/opentheone/actions/workflows/codeql.yml)
-[![Release](https://img.shields.io/github/v/release/wzyjerry/opentheone?include_prereleases&sort=semver)](https://github.com/wzyjerry/opentheone/releases)
+[![CI](https://github.com/opentheone/opentheone/actions/workflows/ci.yml/badge.svg)](https://github.com/opentheone/opentheone/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/opentheone/opentheone/actions/workflows/codeql.yml/badge.svg)](https://github.com/opentheone/opentheone/actions/workflows/codeql.yml)
+[![Release](https://img.shields.io/github/v/release/opentheone/opentheone?include_prereleases&sort=semver)](https://github.com/opentheone/opentheone/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Go Version](https://img.shields.io/badge/go-%E2%89%A51.25-00ADD8?logo=go)](https://go.dev/)
 [![Vue 3](https://img.shields.io/badge/vue-3.x-42b883?logo=vue.js)](https://vuejs.org/)
@@ -31,7 +31,7 @@ OpenTheOne 是商业产品 [TheOne 陪伴](https://one.dxcat.cn/) 的开源替�
 ### 方式一：Docker（推荐）
 
 ```bash
-git clone https://github.com/wzyjerry/opentheone.git
+git clone https://github.com/opentheone/opentheone.git
 cd opentheone
 docker compose up -d
 ```
@@ -44,7 +44,7 @@ docker compose up -d
 依赖：Go ≥ 1.25，pnpm ≥ 9。
 
 ```bash
-git clone https://github.com/wzyjerry/opentheone.git
+git clone https://github.com/opentheone/opentheone.git
 cd opentheone
 make build           # 等价于 pnpm build + go build，会注入 version/commit/build_time
 ./backend/oto-server --version

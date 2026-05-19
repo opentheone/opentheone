@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wzyjerry/opentheone/backend/internal/model"
+	"github.com/opentheone/opentheone/backend/internal/model"
 )
 
 func TestRenderBatchForSummary_ClipsLongMessages(t *testing.T) {

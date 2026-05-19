@@ -10,8 +10,8 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
-	"github.com/wzyjerry/opentheone/backend/internal/model"
-	"github.com/wzyjerry/opentheone/backend/internal/runner"
+	"github.com/opentheone/opentheone/backend/internal/model"
+	"github.com/opentheone/opentheone/backend/internal/runner"
 )
 
 // renderQRDataURI takes the URL that iLink returns in `qrcode_img_content`

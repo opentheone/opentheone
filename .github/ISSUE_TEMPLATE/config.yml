@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: 💬 使用问题 / Usage question
-    url: https://github.com/wzyjerry/opentheone/discussions/categories/q-a
+    url: https://github.com/opentheone/opentheone/discussions/categories/q-a
     about: "请优先去 Discussions 提问。Issues 仅用于明确的 bug 报告和功能请求。"
   - name: 🔒 报告安全漏洞 / Report a vulnerability
-    url: https://github.com/wzyjerry/opentheone/security/advisories/new
+    url: https://github.com/opentheone/opentheone/security/advisories/new
     about: "请通过 Private Vulnerability Report，不要在公开 issue 里描述漏洞。"

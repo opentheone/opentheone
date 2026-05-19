@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"net/http"
 	"os"
 	"strings"
@@ -9,10 +10,34 @@ import (
 	"github.com/robfig/cron/v3"
 	"gorm.io/gorm"
 
-	"github.com/wzyjerry/opentheone/backend/internal/engine"
-	"github.com/wzyjerry/opentheone/backend/internal/model"
-	"github.com/wzyjerry/opentheone/backend/internal/runner"
+	"github.com/opentheone/opentheone/backend/internal/engine"
+	"github.com/opentheone/opentheone/backend/internal/model"
+	"github.com/opentheone/opentheone/backend/internal/persona"
+	"github.com/opentheone/opentheone/backend/internal/runner"
 )
+
+// encodeStringList serializes a []string into the JSON shape used by
+// columns like Persona.EnabledMCPIDs. Empty / nil input → "".
+//
+// We deliberately allocate a fresh slice rather than reusing `in` so we
+// never mutate caller-owned memory (the request body slice).
+func encodeStringList(in []string) string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	buf, err := json.Marshal(out)
+	if err != nil {
+		return ""
+	}
+	return string(buf)
+}
 
 var personaCronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 
@@ -41,15 +66,16 @@ func NewPersonaHandler(db *gorm.DB, mgr *runner.Manager, eng *engine.Engine) *Pe
 }
 
 type personaCreateReq struct {
-	Name            string `json:"name"`
-	Avatar          string `json:"avatar"`
-	Description     string `json:"description"`
-	SystemPrompt    string `json:"system_prompt"`
-	Greeting        string `json:"greeting"`
-	SpeakingStyle   string `json:"speaking_style"`
-	ProactiveCron   string `json:"proactive_cron"`
-	ProactivePrompt string `json:"proactive_prompt"`
-	LLMConfigID     string `json:"llm_config_id"`
+	Name            string   `json:"name"`
+	Avatar          string   `json:"avatar"`
+	Description     string   `json:"description"`
+	SystemPrompt    string   `json:"system_prompt"`
+	Greeting        string   `json:"greeting"`
+	SpeakingStyle   string   `json:"speaking_style"`
+	ProactiveCron   string   `json:"proactive_cron"`
+	ProactivePrompt string   `json:"proactive_prompt"`
+	LLMConfigID     string   `json:"llm_config_id"`
+	EnabledMCPIDs   []string `json:"enabled_mcp_ids"`
 }
 
 func (h *PersonaHandler) Create(c *gin.Context) {
@@ -78,12 +104,19 @@ func (h *PersonaHandler) Create(c *gin.Context) {
 		ProactiveCron:   req.ProactiveCron,
 		ProactivePrompt: req.ProactivePrompt,
 		LLMConfigID:     req.LLMConfigID,
+		EnabledMCPIDs:   encodeStringList(req.EnabledMCPIDs),
 	}
 	if err := h.db.Create(&p).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}
 	ok(c, gin.H{"id": p.ID})
+}
+
+// Templates returns the built-in persona template catalog. Frontend uses
+// this to render one-click "use this template" buttons on the create form.
+func (h *PersonaHandler) Templates(c *gin.Context) {
+	ok(c, gin.H{"items": persona.Templates()})
 }
 
 func (h *PersonaHandler) List(c *gin.Context) {
@@ -112,16 +145,17 @@ func (h *PersonaHandler) Get(c *gin.Context) {
 }
 
 type personaUpdateReq struct {
-	ID              string `json:"id"`
-	Name            string `json:"name"`
-	Avatar          string `json:"avatar"`
-	Description     string `json:"description"`
-	SystemPrompt    string `json:"system_prompt"`
-	Greeting        string `json:"greeting"`
-	SpeakingStyle   string `json:"speaking_style"`
-	ProactiveCron   string `json:"proactive_cron"`
-	ProactivePrompt string `json:"proactive_prompt"`
-	LLMConfigID     string `json:"llm_config_id"`
+	ID              string   `json:"id"`
+	Name            string   `json:"name"`
+	Avatar          string   `json:"avatar"`
+	Description     string   `json:"description"`
+	SystemPrompt    string   `json:"system_prompt"`
+	Greeting        string   `json:"greeting"`
+	SpeakingStyle   string   `json:"speaking_style"`
+	ProactiveCron   string   `json:"proactive_cron"`
+	ProactivePrompt string   `json:"proactive_prompt"`
+	LLMConfigID     string   `json:"llm_config_id"`
+	EnabledMCPIDs   []string `json:"enabled_mcp_ids"`
 }
 
 func (h *PersonaHandler) Update(c *gin.Context) {
@@ -150,6 +184,7 @@ func (h *PersonaHandler) Update(c *gin.Context) {
 		"proactive_cron":   req.ProactiveCron,
 		"proactive_prompt": req.ProactivePrompt,
 		"llm_config_id":    req.LLMConfigID,
+		"enabled_mcp_ids":  encodeStringList(req.EnabledMCPIDs),
 	}
 	if err := h.db.Model(&p).Updates(updates).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 500, err.Error())

@@ -8,12 +8,32 @@ const router = useRouter();
 
 interface Message {
   id: string;
-  direction: "inbound" | "outbound";
+  direction: "inbound" | "outbound" | "tool_call" | "tool_result";
   type: string;
   text: string;
   status: string;
   created_at: string;
   media_url?: string;
+  tool_name?: string;
+  tool_call_id?: string;
+  tool_args?: string;
+  tool_result?: string;
+}
+
+function prettyJSON(raw?: string): string {
+  if (!raw) return "";
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    return raw;
+  }
+}
+
+function shortToolName(name?: string): string {
+  if (!name) return "tool";
+  // mcp__s0__list_files -> list_files; keep raw name as tooltip elsewhere
+  const m = name.match(/^mcp__[^_]+__(.+)$/);
+  return m ? m[1] : name;
 }
 
 const messages = ref<Message[]>([]);
@@ -104,6 +124,7 @@ function isImageMessage(m: Message): boolean {
 
 async function loadAttachments(msgs: Message[]) {
   for (const m of msgs) {
+    if (m.direction !== "inbound" && m.direction !== "outbound") continue;
     if (!isImageMessage(m) || attachments.value[m.id]) continue;
     try {
       const r = await api<{ mime: string; data_base64: string }>(
@@ -216,27 +237,64 @@ onMounted(load);
           {{ loadingMore ? "加载中…" : "加载更多历史" }}
         </button>
       </div>
-      <div v-for="m in grouped" :key="m.id"
-        :class="m.direction === 'outbound' ? 'flex justify-end' : 'flex justify-start'"
-      >
+      <template v-for="m in grouped" :key="m.id">
         <div
-          class="max-w-[80%] rounded-2xl px-4 py-2.5 text-sm whitespace-pre-wrap break-words"
-          :class="m.direction === 'outbound'
-            ? 'bg-accent-500 text-white rounded-br-md'
-            : 'bg-ink-800 text-ink-100 rounded-bl-md'"
+          v-if="m.direction === 'tool_call'"
+          class="flex justify-center"
         >
-          <div v-if="attachments[m.id]" class="mb-2">
-            <img :src="attachments[m.id]" class="max-w-full max-h-64 rounded-md object-contain" />
-          </div>
-          <div v-if="m.text">{{ m.text }}</div>
+          <details class="w-full max-w-[80%] rounded-lg border border-ink-800 bg-ink-900/60 text-[11px]">
+            <summary class="px-3 py-1.5 cursor-pointer text-ink-400 hover:text-ink-200 select-none">
+              <span class="badge text-[10px] mr-1.5">tool call</span>
+              <span class="font-mono text-accent-300">{{ shortToolName(m.tool_name) }}</span>
+              <span class="text-ink-500 ml-2">{{ m.created_at }}</span>
+            </summary>
+            <div class="px-3 py-2 border-t border-ink-800">
+              <div class="text-ink-500 mb-1">arguments:</div>
+              <pre class="text-ink-300 whitespace-pre-wrap break-words font-mono text-[10px]">{{ prettyJSON(m.tool_args) || "(empty)" }}</pre>
+            </div>
+          </details>
+        </div>
+        <div
+          v-else-if="m.direction === 'tool_result'"
+          class="flex justify-center"
+        >
+          <details class="w-full max-w-[80%] rounded-lg border border-ink-800 bg-ink-900/60 text-[11px]">
+            <summary class="px-3 py-1.5 cursor-pointer text-ink-400 hover:text-ink-200 select-none">
+              <span
+                class="badge text-[10px] mr-1.5"
+                :class="m.status === 'failed' ? 'text-rose-300 border-rose-500/40' : 'text-emerald-300 border-emerald-500/40'"
+              >tool {{ m.status === 'failed' ? 'error' : 'result' }}</span>
+              <span class="font-mono text-accent-300">{{ shortToolName(m.tool_name) }}</span>
+              <span class="text-ink-500 ml-2">{{ m.created_at }}</span>
+            </summary>
+            <div class="px-3 py-2 border-t border-ink-800">
+              <pre class="text-ink-300 whitespace-pre-wrap break-words font-mono text-[10px] max-h-64 overflow-auto">{{ m.tool_result || "(empty)" }}</pre>
+            </div>
+          </details>
+        </div>
+        <div
+          v-else
+          :class="m.direction === 'outbound' ? 'flex justify-end' : 'flex justify-start'"
+        >
           <div
-            class="text-[10px] mt-1 opacity-60"
-            :class="m.direction === 'outbound' ? 'text-white/70' : 'text-ink-400'"
+            class="max-w-[80%] rounded-2xl px-4 py-2.5 text-sm whitespace-pre-wrap break-words"
+            :class="m.direction === 'outbound'
+              ? 'bg-accent-500 text-white rounded-br-md'
+              : 'bg-ink-800 text-ink-100 rounded-bl-md'"
           >
-            {{ m.created_at }} · {{ m.type }} · {{ m.status }}
+            <div v-if="attachments[m.id]" class="mb-2">
+              <img :src="attachments[m.id]" class="max-w-full max-h-64 rounded-md object-contain" />
+            </div>
+            <div v-if="m.text">{{ m.text }}</div>
+            <div
+              class="text-[10px] mt-1 opacity-60"
+              :class="m.direction === 'outbound' ? 'text-white/70' : 'text-ink-400'"
+            >
+              {{ m.created_at }} · {{ m.type }} · {{ m.status }}
+            </div>
           </div>
         </div>
-      </div>
+      </template>
     </div>
 
     <div class="card p-3 mt-4 flex gap-2">

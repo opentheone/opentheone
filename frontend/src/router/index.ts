@@ -36,6 +36,11 @@ const router = createRouter({
           component: () => import("@/views/LLMView.vue"),
         },
         {
+          path: "mcp",
+          name: "mcp",
+          component: () => import("@/views/MCPView.vue"),
+        },
+        {
           path: "conversations",
           name: "conversations",
           component: () => import("@/views/ConversationsView.vue"),

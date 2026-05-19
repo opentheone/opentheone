@@ -6,7 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/wzyjerry/opentheone/backend/internal/auth"
+	"github.com/opentheone/opentheone/backend/internal/auth"
 )
 
 // CtxUserIDKey stores the resolved user_id in *gin.Context.

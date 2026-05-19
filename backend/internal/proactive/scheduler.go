@@ -9,8 +9,8 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
-	"github.com/wzyjerry/opentheone/backend/internal/engine"
-	"github.com/wzyjerry/opentheone/backend/internal/model"
+	"github.com/opentheone/opentheone/backend/internal/engine"
+	"github.com/opentheone/opentheone/backend/internal/model"
 )
 
 // Scheduler periodically inspects active personas and triggers proactive messages.

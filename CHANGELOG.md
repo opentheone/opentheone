@@ -49,5 +49,5 @@ database schema may still change before 1.0.
 - **CI**：GitHub Actions 跑 `gofmt` / `go vet` / `go test -race` / `pnpm build` / Docker 镜像 smoke。
 - **文档**：README + 设计文档（doc.md）+ CONTRIBUTING + SECURITY + 本 CHANGELOG。
 
-[Unreleased]: https://github.com/wzyjerry/opentheone/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/wzyjerry/opentheone/releases/tag/v0.1.0
+[Unreleased]: https://github.com/opentheone/opentheone/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/opentheone/opentheone/releases/tag/v0.1.0

@@ -18,12 +18,32 @@ interface Persona {
   proactive_prompt: string;
   is_active: boolean;
   llm_config_id: string;
+  enabled_mcp_ids: string;
 }
 
 interface LLMConfig {
   id: string;
   name: string;
   chat_model: string;
+}
+
+interface MCPServerLite {
+  id: string;
+  name: string;
+  transport: string;
+  enabled: boolean;
+  description: string;
+}
+
+interface MCPToolInfo {
+  name: string;
+  description: string;
+}
+
+interface MCPToolsResult {
+  ok: boolean;
+  error: string;
+  tools: MCPToolInfo[];
 }
 
 interface Memory {
@@ -57,6 +77,11 @@ const phaseLabel: Record<string, string> = {
 
 const persona = ref<Persona | null>(null);
 const llmList = ref<LLMConfig[]>([]);
+const mcpList = ref<MCPServerLite[]>([]);
+const enabledMCPIDs = ref<string[]>([]);
+const mcpExpanded = ref<Record<string, boolean>>({});
+const mcpToolsLoading = ref<Record<string, boolean>>({});
+const mcpToolsCache = ref<Record<string, MCPToolsResult>>({});
 const memories = ref<Memory[]>([]);
 const err = ref("");
 const saving = ref(false);
@@ -71,6 +96,46 @@ const testResult = ref<{ ok: boolean; msg: string } | null>(null);
 async function loadPersona() {
   const p = await api<Persona>("/api/persona/get", { id: props.id });
   persona.value = p;
+  try {
+    enabledMCPIDs.value = p.enabled_mcp_ids ? JSON.parse(p.enabled_mcp_ids) : [];
+  } catch {
+    enabledMCPIDs.value = [];
+  }
+}
+
+async function loadMCP() {
+  try {
+    const r = await api<{ items: MCPServerLite[] }>("/api/mcp/list");
+    mcpList.value = r.items || [];
+  } catch {
+    mcpList.value = [];
+  }
+}
+
+function toggleMCP(id: string) {
+  const set = new Set(enabledMCPIDs.value);
+  if (set.has(id)) set.delete(id);
+  else set.add(id);
+  enabledMCPIDs.value = Array.from(set);
+}
+
+async function toggleMCPTools(id: string) {
+  const next = !mcpExpanded.value[id];
+  mcpExpanded.value = { ...mcpExpanded.value, [id]: next };
+  if (next && !mcpToolsCache.value[id] && !mcpToolsLoading.value[id]) {
+    mcpToolsLoading.value = { ...mcpToolsLoading.value, [id]: true };
+    try {
+      const r = await api<MCPToolsResult>("/api/mcp/tools", { id });
+      mcpToolsCache.value = { ...mcpToolsCache.value, [id]: r };
+    } catch (e: any) {
+      mcpToolsCache.value = {
+        ...mcpToolsCache.value,
+        [id]: { ok: false, error: e?.message || String(e), tools: [] },
+      };
+    } finally {
+      mcpToolsLoading.value = { ...mcpToolsLoading.value, [id]: false };
+    }
+  }
 }
 
 async function loadExistingBinding() {
@@ -110,6 +175,7 @@ async function save() {
       proactive_cron: persona.value.proactive_cron,
       proactive_prompt: persona.value.proactive_prompt,
       llm_config_id: persona.value.llm_config_id,
+      enabled_mcp_ids: enabledMCPIDs.value,
     });
   } catch (e: any) {
     err.value = e?.message || String(e);
@@ -248,7 +314,13 @@ watch(() => props.id, async () => {
 
 onMounted(async () => {
   try {
-    await Promise.all([loadPersona(), loadLLM(), loadMemories(), loadExistingBinding()]);
+    await Promise.all([
+      loadPersona(),
+      loadLLM(),
+      loadMCP(),
+      loadMemories(),
+      loadExistingBinding(),
+    ]);
   } catch (e: any) {
     err.value = e?.message || String(e);
   }
@@ -283,9 +355,20 @@ function back() {
       <div class="space-y-6">
         <div class="card p-6 space-y-4">
           <h2 class="text-lg font-medium">人设</h2>
-          <div>
-            <label class="label">名字</label>
-            <input v-model="persona.name" class="input mt-1" />
+          <div class="grid grid-cols-[80px_1fr] gap-4">
+            <div>
+              <label class="label">头像</label>
+              <input
+                v-model="persona.avatar"
+                class="input mt-1 text-center text-2xl"
+                placeholder="🌸"
+                maxlength="4"
+              />
+            </div>
+            <div>
+              <label class="label">名字</label>
+              <input v-model="persona.name" class="input mt-1" />
+            </div>
           </div>
           <div>
             <label class="label">简介</label>
@@ -320,6 +403,92 @@ function back() {
               </option>
             </select>
           </div>
+
+          <div>
+            <label class="label">启用的 MCP 工具</label>
+            <p class="text-xs text-ink-500 mt-1 mb-2">
+              勾选后，TA 在对话时可以调用对应 MCP 服务里的工具（agent loop）。没勾的不会出现在 TA 的工具列表里。
+            </p>
+            <div v-if="mcpList.length === 0" class="text-xs text-ink-400">
+              还没有 MCP 服务。先到
+              <RouterLink to="/mcp" class="text-accent-400 hover:underline">「MCP 工具」</RouterLink>
+              里添加几个。
+            </div>
+            <ul v-else class="space-y-2">
+              <li
+                v-for="s in mcpList"
+                :key="s.id"
+                class="rounded-lg border border-ink-800 bg-ink-900"
+              >
+                <div class="flex items-start gap-3 px-3 py-2">
+                  <input
+                    type="checkbox"
+                    class="mt-1 rounded"
+                    :checked="enabledMCPIDs.includes(s.id)"
+                    :disabled="!s.enabled"
+                    @change="toggleMCP(s.id)"
+                  />
+                  <div class="flex-1 min-w-0">
+                    <div class="flex items-center gap-2 flex-wrap">
+                      <span class="text-sm font-medium">{{ s.name }}</span>
+                      <span class="badge text-[10px]">{{ s.transport }}</span>
+                      <span
+                        v-if="!s.enabled"
+                        class="badge text-[10px] text-amber-300 border-amber-500/40"
+                      >全局已禁用</span>
+                      <button
+                        type="button"
+                        class="ml-auto text-[11px] text-ink-400 hover:text-ink-100"
+                        :disabled="!s.enabled"
+                        @click="toggleMCPTools(s.id)"
+                      >
+                        {{ mcpExpanded[s.id] ? "收起工具 ▴" : "查看工具 ▾" }}
+                      </button>
+                    </div>
+                    <div v-if="s.description" class="text-[11px] text-ink-500 mt-0.5">
+                      {{ s.description }}
+                    </div>
+                  </div>
+                </div>
+                <div
+                  v-if="mcpExpanded[s.id]"
+                  class="border-t border-ink-800 px-3 py-2 bg-ink-950"
+                >
+                  <div v-if="mcpToolsLoading[s.id]" class="text-[11px] text-ink-500">
+                    加载中…
+                  </div>
+                  <div v-else-if="!mcpToolsCache[s.id]" class="text-[11px] text-ink-500">
+                    点击「查看工具」加载列表
+                  </div>
+                  <div
+                    v-else-if="!mcpToolsCache[s.id].ok"
+                    class="text-[11px] text-rose-400"
+                  >
+                    无法连接：{{ mcpToolsCache[s.id].error }}
+                  </div>
+                  <div
+                    v-else-if="mcpToolsCache[s.id].tools.length === 0"
+                    class="text-[11px] text-ink-500"
+                  >
+                    服务连接正常，但未声明任何工具。
+                  </div>
+                  <ul v-else class="space-y-1.5">
+                    <li
+                      v-for="t in mcpToolsCache[s.id].tools"
+                      :key="t.name"
+                      class="text-[11px]"
+                    >
+                      <div class="font-mono text-accent-300">{{ t.name }}</div>
+                      <div v-if="t.description" class="text-ink-400 ml-3 leading-snug">
+                        {{ t.description }}
+                      </div>
+                    </li>
+                  </ul>
+                </div>
+              </li>
+            </ul>
+          </div>
+
           <button class="btn-primary" :disabled="saving" @click="save">保存</button>
         </div>
       </div>

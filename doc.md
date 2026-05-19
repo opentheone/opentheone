@@ -176,6 +176,7 @@ AutoMigrate 自动建表。完整定义在
 | `proactive_prompt` | text | 主动消息的引导词 |
 | `is_active` | bool | **同 user 内只能有一个 true** |
 | `llm_config_id` | UUID | 关联到一组 LLM 配置 |
+| `enabled_mcp_ids` | text | JSON `[]string`，启用的 MCP server id 列表。空字符串表示禁用工具（走非流式快路径） |
 
 ### 3.4 `we_chat_bindings`
 
@@ -212,15 +213,21 @@ AutoMigrate 自动建表。完整定义在
 | 字段 | 类型 | 备注 |
 |---|---|---|
 | `conversation_id` | UUID | |
-| `direction` | varchar(16) | `inbound` / `outbound` |
+| `direction` | varchar(16) | `inbound` / `outbound` / `tool_call` / `tool_result` |
 | `ilink_message_id` | int64 | iLink 平台分配的全局 ID |
 | `client_id` | varchar(128) | 出站消息的 idempotency 键 |
 | `context_token` | text | 对应 iLink 的 contextToken |
-| `type` | varchar(16) | `text` / `image` / `voice` / `file` / `video` |
-| `text` | text | 文本内容 |
+| `type` | varchar(16) | `text` / `image` / `voice` / `file` / `video` / `tool` |
+| `text` | text | 文本内容（`tool_call` / `tool_result` 行为空） |
 | `media_url` | varchar(255) | 原始 CDN URL |
 | `extra` | text | 序列化的额外字段（JSON） |
-| `status` | varchar(16) | `received` / `sent` / `failed` |
+| `status` | varchar(16) | `received` / `sent` / `failed` / `ok` |
+| `tool_name` | varchar(128) | agent loop 调用的工具名（如 `mcp__s0__list_files`） |
+| `tool_call_id` | varchar(128) | OpenAI tool_call.id，把 `tool_call` 行和对应的 `tool_result` 行串起来 |
+| `tool_args` | text | 工具调用入参（JSON 字符串） |
+| `tool_result` | text | 工具返回（已按 `mcp.maxToolResultRunes` 截断） |
+
+> `tool_call` / `tool_result` 是 agent loop 留下的**审计行**：不会通过 iLink 发出去、不参与滚动摘要、也不进长期记忆抽取；仅供"对话详情"页折叠展示，让用户能看到 AI 这一轮调用了哪些工具、入参/结果是什么。新增字段都是只增列，老库 GORM AutoMigrate 直接兼容。
 
 ### 3.7 `memories`
 
@@ -250,6 +257,24 @@ AutoMigrate 自动建表。完整定义在
 |---|---|---|
 | `key` | varchar(64) UNIQUE | 当前唯一一项 `allow_register` |
 | `value` | text | 文本，业务侧自己解释成 bool / int |
+
+### 3.10 `mcp_servers`
+
+一行 = 一个用户配置的 MCP（Model Context Protocol）服务。
+
+| 字段 | 类型 | 备注 |
+|---|---|---|
+| `user_id` | UUID | 拥有者 |
+| `name` | varchar(64) | 同 user 内最好唯一（导入逻辑按 name 去重） |
+| `description` | text | 给 UI 看的，不喂给 LLM |
+| `transport` | varchar(32) | `stdio` / `streamable_http`（按 MCP 2025-03-26 spec） |
+| `command` | varchar(255) | stdio：可执行命令 |
+| `args` | text | stdio：JSON `[]string` |
+| `env` | text | stdio：JSON `map[string]string` |
+| `url` | varchar(512) | streamable_http：服务端点 |
+| `headers` | text | streamable_http：JSON `map[string]string` |
+| `enabled` | bool | 全局开关，关闭后所有角色都拿不到此 server 的工具 |
+| `timeout_ms` | int | 单次工具调用超时，默认 30000 |
 
 ---
 
@@ -308,6 +333,43 @@ Engine 默认参数（可通过 `engine.Options` 调）：
 iLink CDN 拉加密 blob → AES-128-ECB 解密 → 落盘到
 `storage.attachments_dir`。**有 50MB 硬上限**，防止恶意/异常响应 OOM。
 
+### 4.5 Agent loop & MCP 工具调用
+
+如果当前 persona 启用了至少一个 MCP server（`enabled_mcp_ids` 非空），
+`generateReply` 不会走原本的「单次 chat completion」路径，而是切到 agent
+loop：
+
+1. 通过 `internal/mcp.LoadForPersona` 拉起该 persona 所有启用的 MCP server，
+   列出工具（失败的 server **静默跳过**，不阻塞会话）。每个工具被重命名为
+   `mcp__<shortID>__<toolName>` 喂给 LLM，避免重名冲突也方便回路解析。
+   `shortID` 是 Registry 加载时按顺序分配的紧凑别名（`s0`/`s1`/…），不是 UUID——
+   OpenAI 的工具名上限只有 64 字符，使用 UUID 会把预算压到 21 字符，
+   常见的 MCP 工具名（如 `search_repositories_by_organization`）会被静默丢弃；
+   短别名让工具名预算扩到约 53 字符，覆盖绝大多数实际场景。
+   工具描述会自动拼上 `[<server_name> — <server_description>] ` 前缀，
+   把用户在 MCP 配置里写的人话语义透传给 LLM，便于多 server 共存时区分。
+2. **流式** chat completion（`llm.ChatWithTools`）。流式是必须的——OpenAI
+   把 `tool_calls.function.arguments` 切成多个 chunk，按 `Index` 累积才能
+   拿到完整的 JSON 参数；并发工具调用也只能用流式区分。
+3. 拿到 `ToolCall` → 通过 `mcp.Registry.Invoke` 路由回对应 server → 执行
+   并把结果以 `role:tool` 消息回写进历史 → 下一轮。
+4. 直到 LLM 返回纯文本（无 tool_calls）→ 作为最终回复发送。
+5. **硬上限** `engine.Options.AgentMaxSteps`（默认 6）防止死循环。撞顶时
+   优先返回模型在循环里产出过的最后一段文字（即使它还想再调用工具），
+   仅在完全没有文字回复时才回落到 `（抱歉，我刚刚卡住了，过会儿再聊好吗？）`。
+6. 单次工具结果 > 16k 字符会被截断（`mcp.maxToolResultRunes`），并在末尾
+   附上 `...(truncated, total N chars)`，防止上下文爆炸。
+7. 进程内有 `mcp.Manager` 复用 MCP client 连接，按 `MCPServer.ID` 缓存，
+   配置变更或 30 分钟空闲后自动重建。
+8. 每次工具调用前后，引擎会向 `messages` 表写两条审计行
+   （`direction=tool_call` / `tool_result`，靠 `tool_call_id` 关联）。前端在
+   对话详情里把它们渲染成可折叠的灰条，用户能直接看到 AI 这一轮调用了什么、
+   入参/结果各是什么。审计行**不参与**喂给 LLM 的历史、滚动摘要和长期记忆，
+   也不会通过 iLink 发到微信端。
+
+主动消息（`SendProactive`）**不走** agent loop——主动问候是一句话的事，
+没必要承担工具调用的延迟和复杂度。
+
 ---
 
 ## 5. HTTP API
@@ -352,14 +414,22 @@ iLink CDN 拉加密 blob → AES-128-ECB 解密 → 落盘到
 | POST | `/api/llm/delete` | 删除 |
 | POST | `/api/llm/test` | 跑一次最短的 chat 探活 |
 | POST | `/api/llm/providers` | 取内置预置列表（DeepSeek / OpenAI / Qwen / Kimi / Claude） |
-| POST | `/api/persona/create` | 新建 persona（校验 `proactive_cron`） |
+| POST | `/api/persona/create` | 新建 persona（校验 `proactive_cron`，支持 `enabled_mcp_ids`） |
 | POST | `/api/persona/list` | 列表 |
 | POST | `/api/persona/get` | 详情 |
-| POST | `/api/persona/update` | 改人设、风格、cron |
+| POST | `/api/persona/update` | 改人设、风格、cron、`enabled_mcp_ids` |
 | POST | `/api/persona/delete` | 删除（级联清 binding） |
 | POST | `/api/persona/activate` | 设为"唯一" (强制只允许一个 active) |
 | POST | `/api/persona/deactivate` | 取消激活 |
 | POST | `/api/persona/trigger_proactive` | 立即跑一次主动消息（调试用） |
+| POST | `/api/persona/templates` | 取内置人设模板（温柔小棠 / 高冷沈姐 / 元气橘子 / J 博士 …） |
+| POST | `/api/mcp/create` | 新建 MCP 服务（`stdio` / `streamable_http`） |
+| POST | `/api/mcp/list` | 当前用户的 MCP 服务列表（含 args/env/headers 反序列化） |
+| POST | `/api/mcp/update` | 编辑（会 invalidate 进程内缓存的连接） |
+| POST | `/api/mcp/delete` | 删除，并自动从引用它的 persona 中摘掉 |
+| POST | `/api/mcp/test` | 探活：开新连接 → initialize → list_tools，返回可用工具数量 |
+| POST | `/api/mcp/tools` | 拿单个 MCP server 的工具列表（用缓存连接，便于 persona 配置页内联预览） |
+| POST | `/api/mcp/import` | 粘贴标准 `mcpServers` JSON 批量导入（Claude Desktop / Cursor 通用） |
 | POST | `/api/binding/start` | 拿一张二维码（调 iLink `getqrcode`） |
 | POST | `/api/binding/status` | 轮询扫码状态 |
 | POST | `/api/binding/active` | 当前已激活 binding |

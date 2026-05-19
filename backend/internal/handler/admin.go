@@ -7,20 +7,22 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
-	"github.com/wzyjerry/opentheone/backend/internal/auth"
-	"github.com/wzyjerry/opentheone/backend/internal/model"
-	"github.com/wzyjerry/opentheone/backend/internal/runner"
-	"github.com/wzyjerry/opentheone/backend/internal/settings"
+	"github.com/opentheone/opentheone/backend/internal/auth"
+	"github.com/opentheone/opentheone/backend/internal/mcp"
+	"github.com/opentheone/opentheone/backend/internal/model"
+	"github.com/opentheone/opentheone/backend/internal/runner"
+	"github.com/opentheone/opentheone/backend/internal/settings"
 )
 
 type AdminHandler struct {
 	db       *gorm.DB
 	settings *settings.Service
 	mgr      *runner.Manager
+	mcp      *mcp.Manager
 }
 
-func NewAdminHandler(db *gorm.DB, set *settings.Service, mgr *runner.Manager) *AdminHandler {
-	return &AdminHandler{db: db, settings: set, mgr: mgr}
+func NewAdminHandler(db *gorm.DB, set *settings.Service, mgr *runner.Manager, mcpMgr *mcp.Manager) *AdminHandler {
+	return &AdminHandler{db: db, settings: set, mgr: mgr, mcp: mcpMgr}
 }
 
 type adminUserItem struct {
@@ -160,6 +162,11 @@ func (h *AdminHandler) DeleteUser(c *gin.Context) {
 	if len(bindingIDs) > 0 {
 		_ = h.db.Model(&model.Conversation{}).Where("binding_id IN ?", bindingIDs).Pluck("id", &convIDs).Error
 	}
+	// Collect MCP server ids so we can invalidate their cached client
+	// connections after the DB rows are gone (a stdio MCP subprocess that
+	// outlives its row would happily keep running otherwise).
+	var mcpIDs []string
+	_ = h.db.Model(&model.MCPServer{}).Where("user_id = ?", req.UserID).Pluck("id", &mcpIDs).Error
 	var attachmentPaths []string
 	if len(convIDs) > 0 {
 		_ = h.db.Model(&model.Attachment{}).
@@ -216,6 +223,11 @@ func (h *AdminHandler) DeleteUser(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}
+	if err := tx.Where("user_id = ?", req.UserID).Delete(&model.MCPServer{}).Error; err != nil {
+		tx.Rollback()
+		fail(c, http.StatusInternalServerError, 500, err.Error())
+		return
+	}
 	if err := tx.Where("id = ?", req.UserID).Delete(&model.User{}).Error; err != nil {
 		tx.Rollback()
 		fail(c, http.StatusInternalServerError, 500, err.Error())
@@ -226,6 +238,11 @@ func (h *AdminHandler) DeleteUser(c *gin.Context) {
 	for _, p := range attachmentPaths {
 		if p != "" {
 			_ = os.Remove(p)
+		}
+	}
+	if h.mcp != nil {
+		for _, mid := range mcpIDs {
+			h.mcp.Invalidate(mid)
 		}
 	}
 
