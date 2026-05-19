@@ -237,6 +237,11 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/opentheone
           tags: |
+            # `{{version}}` strips the leading `v`, so a tag push of `v0.0.3`
+            # only yields `0.0.3` / `0.0` / `0`. Add `type=ref,event=tag` so the
+            # *original* ref (`v0.0.3`) is also published — that's the form our
+            # release notes advertise (`docker pull …:${{ github.ref_name }}`).
+            type=ref,event=tag
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
