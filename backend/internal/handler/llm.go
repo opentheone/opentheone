@@ -25,14 +25,18 @@ func NewLLMHandler(db *gorm.DB, secret string) *LLMHandler {
 }
 
 type llmCreateReq struct {
-	Name           string  `json:"name"`
-	BaseURL        string  `json:"base_url"`
-	APIKey         string  `json:"api_key"`
-	ChatModel      string  `json:"chat_model"`
-	EmbeddingModel string  `json:"embedding_model"`
-	Temperature    float32 `json:"temperature"`
-	MaxTokens      int     `json:"max_tokens"`
-	IsDefault      bool    `json:"is_default"`
+	Name           string `json:"name"`
+	BaseURL        string `json:"base_url"`
+	APIKey         string `json:"api_key"`
+	ChatModel      string `json:"chat_model"`
+	EmbeddingModel string `json:"embedding_model"`
+	// Temperature is a pointer so the zero value (`0`, deterministic
+	// decoding — a perfectly valid request) is distinguishable from
+	// "field absent in body". The previous `float32` plus `== 0 ⇒ 0.8`
+	// shortcut silently overrode any user who intended exactly zero.
+	Temperature *float32 `json:"temperature"`
+	MaxTokens   int      `json:"max_tokens"`
+	IsDefault   bool     `json:"is_default"`
 }
 
 func (h *LLMHandler) Create(c *gin.Context) {
@@ -51,8 +55,11 @@ func (h *LLMHandler) Create(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}
-	if req.Temperature == 0 {
-		req.Temperature = 0.8
+	// Default to 0.8 only when the caller didn't pass anything; an explicit
+	// `temperature: 0` flows through verbatim.
+	temp := float32(0.8)
+	if req.Temperature != nil && *req.Temperature >= 0 {
+		temp = *req.Temperature
 	}
 	if req.MaxTokens <= 0 {
 		req.MaxTokens = 1024
@@ -65,7 +72,7 @@ func (h *LLMHandler) Create(c *gin.Context) {
 		APIKeyEnc:      enc,
 		ChatModel:      req.ChatModel,
 		EmbeddingModel: req.EmbeddingModel,
-		Temperature:    req.Temperature,
+		Temperature:    temp,
 		MaxTokens:      req.MaxTokens,
 		IsDefault:      req.IsDefault,
 	}
@@ -126,15 +133,19 @@ func (h *LLMHandler) Providers(c *gin.Context) {
 }
 
 type llmUpdateReq struct {
-	ID             string  `json:"id"`
-	Name           string  `json:"name"`
-	BaseURL        string  `json:"base_url"`
-	APIKey         string  `json:"api_key"`
-	ChatModel      string  `json:"chat_model"`
-	EmbeddingModel string  `json:"embedding_model"`
-	Temperature    float32 `json:"temperature"`
-	MaxTokens      int     `json:"max_tokens"`
-	IsDefault      bool    `json:"is_default"`
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	BaseURL        string `json:"base_url"`
+	APIKey         string `json:"api_key"`
+	ChatModel      string `json:"chat_model"`
+	EmbeddingModel string `json:"embedding_model"`
+	// Temperature and MaxTokens are pointers so the zero value is
+	// distinguishable from "field absent". A user setting temperature=0
+	// (deterministic decoding) is a perfectly valid request; the previous
+	// `> 0` guard silently dropped it on the floor.
+	Temperature *float32 `json:"temperature"`
+	MaxTokens   *int     `json:"max_tokens"`
+	IsDefault   bool     `json:"is_default"`
 }
 
 func (h *LLMHandler) Update(c *gin.Context) {
@@ -160,11 +171,11 @@ func (h *LLMHandler) Update(c *gin.Context) {
 		updates["chat_model"] = req.ChatModel
 	}
 	updates["embedding_model"] = req.EmbeddingModel
-	if req.Temperature > 0 {
-		updates["temperature"] = req.Temperature
+	if req.Temperature != nil && *req.Temperature >= 0 {
+		updates["temperature"] = *req.Temperature
 	}
-	if req.MaxTokens > 0 {
-		updates["max_tokens"] = req.MaxTokens
+	if req.MaxTokens != nil && *req.MaxTokens > 0 {
+		updates["max_tokens"] = *req.MaxTokens
 	}
 	updates["is_default"] = req.IsDefault
 	if req.APIKey != "" {

@@ -42,7 +42,12 @@ const loading = ref(false);
 const loadingMore = ref(false);
 const manual = ref("");
 const scrollEl = ref<HTMLElement | null>(null);
+// attachments holds inline data URIs for messages where we want to *render*
+// the bytes (images). Voice/file/video are too large or unrenderable in a
+// chat bubble — for those we keep just a download button that hits
+// /api/attachment/get on click instead of eagerly pulling base64.
 const attachments = ref<Record<string, string>>({});
+const downloadingAttachment = ref<Record<string, boolean>>({});
 const errMsg = ref("");
 const summary = ref("");
 const summaryUpdatedAt = ref("");
@@ -122,6 +127,29 @@ function isImageMessage(m: Message): boolean {
   return false;
 }
 
+// hasDownloadableAttachment is the "render a download button" predicate:
+// the message ostensibly carries a non-image media payload that the engine
+// would have decrypted to disk. We deliberately don't eagerly fetch these —
+// voice files can be hundreds of KB and there's no useful in-browser render
+// for SILK; videos can be MB+. Click triggers an on-demand download.
+function hasDownloadableAttachment(m: Message): boolean {
+  if (m.type === "image") return false;
+  return m.type === "voice" || m.type === "file" || m.type === "video";
+}
+
+function attachmentLabel(m: Message): string {
+  switch (m.type) {
+    case "voice":
+      return "下载语音";
+    case "video":
+      return "下载视频";
+    case "file":
+      return "下载文件";
+    default:
+      return "下载附件";
+  }
+}
+
 async function loadAttachments(msgs: Message[]) {
   for (const m of msgs) {
     if (m.direction !== "inbound" && m.direction !== "outbound") continue;
@@ -138,6 +166,47 @@ async function loadAttachments(msgs: Message[]) {
     } catch {
       // 附件可能未下载完毕、过大或被清理，忽略即可
     }
+  }
+}
+
+// b64ToBlob converts the base64 payload returned by /api/attachment/get into
+// a Blob, going through a Uint8Array so we don't break binary content via
+// the JS string-as-utf16 conversion that direct `atob` → `new Blob([str])`
+// causes for non-text payloads.
+function b64ToBlob(b64: string, mime: string): Blob {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: mime || "application/octet-stream" });
+}
+
+async function downloadAttachment(m: Message) {
+  if (downloadingAttachment.value[m.id]) return;
+  downloadingAttachment.value = { ...downloadingAttachment.value, [m.id]: true };
+  try {
+    const r = await api<{
+      mime: string;
+      data_base64: string;
+      filename: string;
+    }>("/api/attachment/get", { message_id: m.id });
+    if (!r?.data_base64) {
+      errMsg.value = "附件还没下载完毕或已被清理";
+      return;
+    }
+    const blob = b64ToBlob(r.data_base64, r.mime);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = r.filename || `${m.type || "attachment"}-${m.id}`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (e: any) {
+    errMsg.value = e?.message || String(e);
+  } finally {
+    downloadingAttachment.value = {
+      ...downloadingAttachment.value,
+      [m.id]: false,
+    };
   }
 }
 
@@ -286,6 +355,16 @@ onMounted(load);
               <img :src="attachments[m.id]" class="max-w-full max-h-64 rounded-md object-contain" />
             </div>
             <div v-if="m.text">{{ m.text }}</div>
+            <div v-if="hasDownloadableAttachment(m)" class="mt-2">
+              <button
+                class="text-[11px] underline underline-offset-2 disabled:opacity-50"
+                :class="m.direction === 'outbound' ? 'text-white/90 hover:text-white' : 'text-accent-300 hover:text-accent-200'"
+                :disabled="downloadingAttachment[m.id]"
+                @click="downloadAttachment(m)"
+              >
+                {{ downloadingAttachment[m.id] ? "下载中…" : attachmentLabel(m) }}
+              </button>
+            </div>
             <div
               class="text-[10px] mt-1 opacity-60"
               :class="m.direction === 'outbound' ? 'text-white/70' : 'text-ink-400'"

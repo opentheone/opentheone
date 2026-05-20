@@ -190,8 +190,19 @@ func (h *MCPHandler) Update(c *gin.Context) {
 		"env":         patched.Env,
 		"url":         patched.URL,
 		"headers":     patched.Headers,
-		"enabled":     patched.Enabled,
 		"timeout_ms":  patched.TimeoutMs,
+	}
+	// Only mutate `enabled` when the client explicitly sent it.
+	//
+	// `mcpCreateReq.Enabled` is `*bool` precisely so the absence of the
+	// field is distinguishable from `false`. The previous version always
+	// piped `patched.Enabled` into the updates map — and toRow's default
+	// for the missing pointer is `true`. A "just rename this server" PATCH
+	// from the frontend therefore silently flipped a previously-disabled
+	// MCP back on, which then participated in the next agent loop without
+	// the user's consent.
+	if req.Enabled != nil {
+		updates["enabled"] = *req.Enabled
 	}
 	if err := h.db.Model(&row).Updates(updates).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 500, err.Error())

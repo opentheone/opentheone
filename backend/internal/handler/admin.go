@@ -228,7 +228,14 @@ func (h *AdminHandler) DeleteUser(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}
-	tx.Commit()
+	// See conversation.Delete: a Commit failure here MUST short-circuit the
+	// post-commit side effects (file deletion, MCP cache invalidation),
+	// otherwise we tear down attachments and live subprocesses while the DB
+	// rows still exist — strictly worse than rolling back cleanly.
+	if err := tx.Commit().Error; err != nil {
+		fail(c, http.StatusInternalServerError, 500, err.Error())
+		return
+	}
 
 	for _, p := range attachmentPaths {
 		if p != "" {

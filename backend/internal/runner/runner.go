@@ -428,7 +428,20 @@ func (r *bindingRunner) handleMessage(binding *model.WeChatBinding, msg ilink.We
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(r.ctx, 120*time.Second)
+	// 4 minutes is the deadline budget. With MCP enabled, HandleInbound can
+	// run an agent loop of up to AgentMaxSteps=6 turns; each turn may execute
+	// tool calls with their own per-call deadline (default 30s each via
+	// MCPServer.TimeoutMs). The previous 120s cap got hit by perfectly
+	// well-behaved configurations — e.g. two tool calls per step at 30s each
+	// over a few steps — and showed up as cryptic "context deadline exceeded"
+	// errors followed by silent message drops.
+	//
+	// We don't try to compute a precise budget from agentMaxSteps × tool
+	// timeout × concurrency: that math is fragile (parallel tool calls vs.
+	// sequential, model-side latency, etc.) and an over-generous fixed
+	// timeout costs nothing in the steady state because (a) most chats are
+	// short and (b) the per-tool TimeoutMs still caps the worst single call.
+	ctx, cancel := context.WithTimeout(r.ctx, 4*time.Minute)
 	defer cancel()
 	if err := r.mgr.engine.HandleInbound(ctx, binding, &persona, llmCfgPtr, msg); err != nil {
 		r.log.Error("handle inbound failed", zap.Error(err))

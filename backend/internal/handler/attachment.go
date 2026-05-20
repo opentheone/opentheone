@@ -65,15 +65,23 @@ func (h *AttachmentHandler) Get(c *gin.Context) {
 		fail(c, http.StatusNotFound, 404, "no local file")
 		return
 	}
-	data, err := os.ReadFile(att.LocalPath)
+	// Stat-then-read so a 50MB attachment (the engine's hard upload cap)
+	// can be rejected with 413 without first allocating 50MB into the gin
+	// request goroutine. The old code did `os.ReadFile` unconditionally and
+	// then checked `len(data)`, which is a free OOM vector on small VMs.
+	const maxBytes = 8 * 1024 * 1024
+	st, err := os.Stat(att.LocalPath)
 	if err != nil {
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}
-
-	const maxBytes = 8 * 1024 * 1024
-	if len(data) > maxBytes {
+	if st.Size() > maxBytes {
 		fail(c, http.StatusRequestEntityTooLarge, 413, "file too large to inline")
+		return
+	}
+	data, err := os.ReadFile(att.LocalPath)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}
 

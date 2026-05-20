@@ -201,7 +201,7 @@ func (e *Engine) HandleInbound(ctx context.Context, binding *model.WeChatBinding
 		hasMedia := false
 		for i := range msg.ItemList {
 			switch msg.ItemList[i].Type {
-			case ilink.ItemTypeImage, ilink.ItemTypeFile, ilink.ItemTypeVoice:
+			case ilink.ItemTypeImage, ilink.ItemTypeFile, ilink.ItemTypeVoice, ilink.ItemTypeVideo:
 				hasMedia = true
 			}
 		}
@@ -265,7 +265,7 @@ func (e *Engine) HandleInbound(ctx context.Context, binding *model.WeChatBinding
 		ILinkBotID:  binding.ILinkBotID,
 		ILinkUserID: binding.ILinkUserID,
 	}
-	typingTicket := e.ensureTypingTicket(ctx, binding, sess, msg.FromUserID, msg.ContextToken)
+	typingTicket := e.ensureTypingTicket(ctx, sess, msg.FromUserID, msg.ContextToken)
 	if typingTicket != "" {
 		_ = e.ilink.SendTyping(ctx, sess, msg.FromUserID, typingTicket, 1)
 	}
@@ -654,27 +654,37 @@ func buildSystemPrompt(p *model.Persona, firstInteraction bool) string {
 	return b.String()
 }
 
-// ensureTypingTicket fetches and caches a typing ticket if absent / stale.
-func (e *Engine) ensureTypingTicket(ctx context.Context, binding *model.WeChatBinding, sess ilink.Session, toUserID, contextToken string) string {
-	if binding.TypingTicket != "" && time.Since(binding.TypingTicketAt) < 12*time.Hour {
-		return binding.TypingTicket
-	}
+// ensureTypingTicket fetches a typing ticket for the given (peer, context_token).
+//
+// We deliberately do NOT cache the ticket on the WeChatBinding row anymore: the
+// /ilink/bot/getconfig request is parameterized by `ilink_user_id` (the peer
+// we're chatting with), so a ticket fetched for peer A is at best ignored and
+// at worst rejected by the server when used to "I'm typing" to peer B. The
+// old per-binding cache silently misbehaved as soon as a single bot had two
+// active conversations — exactly the documented use case.
+//
+// One extra getconfig HTTP call per inbound message is cheap (≤ 50 ms over a
+// warm connection) compared to the LLM + MCP work that follows it, and we
+// always run it BEFORE the LLM call so it's not on the user-perceived latency
+// critical path the way an in-the-loop call would be.
+//
+// The TypingTicket / TypingTicketAt columns on the model remain for backward
+// compatibility (they may be set by older builds; we just no longer read
+// them).
+func (e *Engine) ensureTypingTicket(ctx context.Context, sess ilink.Session, toUserID, contextToken string) string {
 	ticket, err := e.ilink.GetTypingTicket(ctx, sess, toUserID, contextToken)
 	if err != nil || ticket == "" {
 		return ""
 	}
-	binding.TypingTicket = ticket
-	binding.TypingTicketAt = time.Now()
-	_ = e.db.WithContext(ctx).Model(&model.WeChatBinding{}).
-		Where("id = ?", binding.ID).
-		Updates(map[string]interface{}{
-			"typing_ticket":    ticket,
-			"typing_ticket_at": binding.TypingTicketAt,
-		}).Error
 	return ticket
 }
 
 // splitForWeChat tries to split text on paragraph boundaries to fit the 2000-char limit.
+//
+// All emitted chunks are guaranteed non-empty after TrimSpace: a window that
+// happens to land on a run of pure whitespace would otherwise produce an empty
+// string, and iLink's sendmessage rejects empty TextItem payloads with a
+// confusing "ret=-1" error that masks the real cause.
 func splitForWeChat(text string, maxChars int) []string {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -687,11 +697,14 @@ func splitForWeChat(text string, maxChars int) []string {
 	remaining := text
 	for utf8.RuneCountInString(remaining) > maxChars {
 		cut := findSplit(remaining, maxChars)
-		out = append(out, strings.TrimSpace(remaining[:cut]))
+		chunk := strings.TrimSpace(remaining[:cut])
+		if chunk != "" {
+			out = append(out, chunk)
+		}
 		remaining = strings.TrimLeft(remaining[cut:], "\n ")
 	}
-	if strings.TrimSpace(remaining) != "" {
-		out = append(out, strings.TrimSpace(remaining))
+	if tail := strings.TrimSpace(remaining); tail != "" {
+		out = append(out, tail)
 	}
 	return out
 }

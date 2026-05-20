@@ -274,7 +274,13 @@ func (h *PersonaHandler) Delete(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}
-	tx.Commit()
+	// See conversation.Delete: short-circuit on Commit failure so we don't
+	// rip files off disk while the persona/conversation/message rows are
+	// still live.
+	if err := tx.Commit().Error; err != nil {
+		fail(c, http.StatusInternalServerError, 500, err.Error())
+		return
+	}
 
 	for _, p := range attachmentPaths {
 		if p != "" {
@@ -357,7 +363,14 @@ func (h *PersonaHandler) Deactivate(c *gin.Context) {
 			return
 		}
 	}
-	tx.Commit()
+	// If Commit fails we MUST NOT stop the runners — otherwise the bindings
+	// stay "active" in the DB but their long-poll loops are dead, which
+	// presents as a silent "AI is online but never replies" state until the
+	// next process restart.
+	if err := tx.Commit().Error; err != nil {
+		fail(c, http.StatusInternalServerError, 500, err.Error())
+		return
+	}
 
 	for _, b := range toPause {
 		h.mgr.Stop(b.ID)
@@ -416,7 +429,13 @@ func (h *PersonaHandler) Activate(c *gin.Context) {
 			return
 		}
 	}
-	tx.Commit()
+	// See Deactivate above: failing to commit then stopping runners would
+	// desync DB state ("active") from runtime state (no goroutine) and
+	// silently break inbound delivery for the user.
+	if err := tx.Commit().Error; err != nil {
+		fail(c, http.StatusInternalServerError, 500, err.Error())
+		return
+	}
 
 	for _, b := range toPause {
 		h.mgr.Stop(b.ID)

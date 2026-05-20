@@ -104,14 +104,24 @@ func (h *MemoryHandler) UpsertManual(c *gin.Context) {
 		fail(c, http.StatusNotFound, 404, "persona not found")
 		return
 	}
+	// Resolve the LLM client used to embed the new memory. Order:
+	//   1. The persona's explicitly configured llm_config_id
+	//   2. The user's is_default = true config
+	// Without the fallback, any persona that hadn't been pinned to a specific
+	// model would silently bypass embedding — and the manual memory would
+	// then be invisible to vector-similarity retrieval (only reachable via
+	// the importance/recency pre-filter), defeating the point of adding it.
 	var llmClient *llm.Client
+	var cfg model.LLMConfig
 	if p.LLMConfigID != "" {
-		var cfg model.LLMConfig
-		if err := h.db.Where("id = ?", p.LLMConfigID).First(&cfg).Error; err == nil {
-			key, err := crypto.Decrypt(h.secret, cfg.APIKeyEnc)
-			if err == nil {
-				llmClient = llm.NewClient(&cfg, key)
-			}
+		_ = h.db.Where("id = ?", p.LLMConfigID).First(&cfg).Error
+	}
+	if cfg.ID == "" {
+		_ = h.db.Where("user_id = ? AND is_default = ?", uid, true).First(&cfg).Error
+	}
+	if cfg.ID != "" {
+		if key, err := crypto.Decrypt(h.secret, cfg.APIKeyEnc); err == nil && key != "" {
+			llmClient = llm.NewClient(&cfg, key)
 		}
 	}
 	if err := h.mem.Ingest(c.Request.Context(), llmClient, req.PersonaID, "", "", req.Kind, req.Content, req.Importance); err != nil {

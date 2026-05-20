@@ -52,6 +52,12 @@ func (e *Engine) downloadIfNeeded(ctx context.Context, msgID string, item *ilink
 		if filenameHint == "" {
 			filenameHint = "file"
 		}
+		// File mime is unknowable without sniffing; we leave it on the
+		// attachment row so the HTTP handler can fall back to the catch-all
+		// "application/octet-stream" rather than a wrong guess. The
+		// filename extension is preserved on disk for clients that can
+		// dispatch by extension.
+		expectedMime = "application/octet-stream"
 	case ilink.ItemTypeVoice:
 		kind = "voice"
 		if item.VoiceItem == nil || item.VoiceItem.Media == nil {
@@ -60,6 +66,26 @@ func (e *Engine) downloadIfNeeded(ctx context.Context, msgID string, item *ilink
 		encryptParam = item.VoiceItem.Media.EncryptQueryParam
 		aesKey = item.VoiceItem.Media.AESKey
 		filenameHint = "voice.silk"
+		// WeChat voice notes are SILK-encoded. No registered IANA mime; the
+		// de-facto string in the WeChat ecosystem is "audio/silk". Browsers
+		// won't play it natively, but at least the download dialog shows a
+		// sensible type and command-line tooling (ffmpeg, silk_v3_decoder)
+		// can pick it up.
+		expectedMime = "audio/silk"
+	case ilink.ItemTypeVideo:
+		// Without a video branch the engine used to silently skip every
+		// inbound video — the conversation showed "[video]" but the bytes
+		// never landed on disk and /api/attachment/get returned 404. The
+		// VideoItem schema mirrors ImageItem/FileItem with an outer
+		// CDNMedia, so the same decrypt path works.
+		kind = "video"
+		if item.VideoItem == nil || item.VideoItem.Media == nil {
+			return
+		}
+		encryptParam = item.VideoItem.Media.EncryptQueryParam
+		aesKey = item.VideoItem.Media.AESKey
+		filenameHint = "video.mp4"
+		expectedMime = "video/mp4"
 	default:
 		return
 	}

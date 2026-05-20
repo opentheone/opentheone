@@ -304,7 +304,15 @@ func (h *ConversationHandler) Delete(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}
-	tx.Commit()
+	// Commit before we touch the filesystem. If the commit itself fails (rare
+	// but possible — disk full, fsync error, locked-by-another-writer) we
+	// MUST NOT proceed to delete the attachment blobs: otherwise the DB
+	// still references the rows but the bytes are gone, leaving every
+	// /api/attachment/get for this conversation 404ing forever.
+	if err := tx.Commit().Error; err != nil {
+		fail(c, http.StatusInternalServerError, 500, err.Error())
+		return
+	}
 
 	for _, p := range attachmentPaths {
 		if p != "" {

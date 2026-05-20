@@ -34,15 +34,21 @@ type User struct {
 // LLMConfig stores OpenAI-compatible endpoints and credentials.
 type LLMConfig struct {
 	BaseModel
-	UserID         string  `gorm:"index;size:36;not null" json:"user_id"`
-	Name           string  `gorm:"size:64;not null" json:"name"`
-	BaseURL        string  `gorm:"size:255;not null" json:"base_url"`
-	APIKeyEnc      string  `gorm:"type:text" json:"-"` // encrypted
-	ChatModel      string  `gorm:"size:128;not null" json:"chat_model"`
-	EmbeddingModel string  `gorm:"size:128" json:"embedding_model"`
-	Temperature    float32 `gorm:"default:0.8" json:"temperature"`
-	MaxTokens      int     `gorm:"default:1024" json:"max_tokens"`
-	IsDefault      bool    `gorm:"default:false" json:"is_default"`
+	UserID         string `gorm:"index;size:36;not null" json:"user_id"`
+	Name           string `gorm:"size:64;not null" json:"name"`
+	BaseURL        string `gorm:"size:255;not null" json:"base_url"`
+	APIKeyEnc      string `gorm:"type:text" json:"-"` // encrypted
+	ChatModel      string `gorm:"size:128;not null" json:"chat_model"`
+	EmbeddingModel string `gorm:"size:128" json:"embedding_model"`
+	// Temperature has no GORM `default:` tag on purpose: with `default:` set,
+	// GORM omits zero values from the INSERT statement so the database default
+	// kicks in — which silently rewrites an explicitly requested
+	// `temperature=0` (deterministic decoding) to 0.8. The handler layer is
+	// now the single source of truth for the "missing field → 0.8" rule, so
+	// any value the application hands GORM is written verbatim.
+	Temperature float32 `json:"temperature"`
+	MaxTokens   int     `gorm:"default:1024" json:"max_tokens"`
+	IsDefault   bool    `gorm:"default:false" json:"is_default"`
 }
 
 // Persona is an AI role/persona created by user.
@@ -192,7 +198,13 @@ type MCPServer struct {
 	Headers string `gorm:"type:text" json:"headers"` // JSON map[string]string
 	// Enabled is a global on/off; even if a persona references it, a disabled
 	// server is skipped during tool discovery.
-	Enabled bool `gorm:"default:true" json:"enabled"`
+	// Enabled has no GORM `default:` tag: see LLMConfig.Temperature above for
+	// the rationale. With `default:true`, GORM omits the zero value (`false`)
+	// from the INSERT, so a client request `{"enabled": false}` would land
+	// as `enabled = true` in the database. The handler layer always sets
+	// Enabled explicitly (defaulting to true when the field is absent), so
+	// the column-level default is unnecessary AND actively harmful.
+	Enabled bool `json:"enabled"`
 	// TimeoutMs caps a single tool invocation. 0 falls back to a 30s default.
 	TimeoutMs int `gorm:"default:30000" json:"timeout_ms"`
 }
