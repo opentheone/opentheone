@@ -1,7 +1,7 @@
 ####################################
 # Stage 1: build the Vue 3 frontend
 ####################################
-FROM node:20-alpine AS frontend
+FROM node:26-alpine AS frontend
 WORKDIR /src/frontend
 
 # Cache deps first so source-only changes don't bust the layer.
