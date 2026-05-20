@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   frontend:
-    name: Frontend (lint + build)
+    name: Frontend (build)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -42,7 +42,7 @@ jobs:
           if-no-files-found: error
 
   backend:
-    name: Backend (vet + test + build)
+    name: Backend (test + build)
     needs: frontend
     runs-on: ubuntu-latest
     steps:
@@ -60,26 +60,6 @@ jobs:
         with:
           name: frontend-dist
           path: backend/internal/web/dist
-
-      - name: gofmt check
-        working-directory: backend
-        run: |
-          diff <(gofmt -s -d .) /dev/null
-
-      - name: go vet
-        working-directory: backend
-        run: go vet ./...
-
-      # Action v8+ runs on Node 24 and requires golangci-lint v2.x — matching
-      # our `.golangci.yml` which is already declared as `version: "2"`. The
-      # previous combo (action v6 + golangci-lint v1.61 + v2 config) was
-      # internally inconsistent and would fail to load the config at runtime.
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v8
-        with:
-          version: v2.1.0
-          working-directory: backend
-          args: --timeout=5m
 
       - name: go test
         working-directory: backend

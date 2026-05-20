@@ -47,11 +47,14 @@ go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.61
 # 或者 brew install golangci-lint
 ```
 
-如果你不想用 Make：
+如果你不想用 Make（**注意 `-tags sqlite_fts5` 不能漏**，否则启动 / 测试会报 `no such module: fts5`）：
 
 ```bash
 cd frontend && pnpm build
-cd ../backend && go test ./... && go vet ./... && go build ./...
+cd ../backend && \
+  go test -tags sqlite_fts5 ./... && \
+  go vet  -tags sqlite_fts5 ./... && \
+  go build -tags sqlite_fts5 ./...
 ```
 
 ## 提 PR 前请确认
@@ -68,9 +71,14 @@ cd ../backend && go test ./... && go vet ./... && go build ./...
 backend/internal/
   ilink/      微信 iLink 协议层。改这里需要对照官方文档；不要"猜测"协议字段。
   llm/        OpenAI 兼容客户端。保持薄；专用逻辑放 engine。
-  engine/     对话核心。新规则（system prompt 等）从这里走。
+  engine/     对话核心。新规则（system prompt header 拼装、agent loop、内置工具
+              路由）从这里走。注意 system prompt 的「稳定段」改动会击穿 LLM
+              的 prompt prefix cache，会显著抬高 token 成本。
   runner/     长轮询。修改时务必保持 panic-safe，不要把 ctx 泄漏。
-  memory/     长期记忆。请避免在这里做"业务侧"决策。
+  memory/     长期记忆金字塔（L0 消息 → L1 原子 → L2 场景 → L3 画像 + BM25 FTS5）。
+              所有 LLM 调度走 `memory.Pipeline`；新增写入必须同步维护 FTS 索引；
+              新增表请检查是否要在 persona.Delete / admin.DeleteUser /
+              conversation.Delete 的级联清单里加一行。
   handler/    HTTP 层。只做参数校验、调用业务包、返回 JSON。
   middleware/ 中间件。
   model/      GORM 模型。**只增字段，不要破坏老数据**。

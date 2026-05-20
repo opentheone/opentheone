@@ -264,10 +264,45 @@ func (h *PersonaHandler) Delete(c *gin.Context) {
 			return
 		}
 	}
+	// L1 atoms (also wipe their FTS index — memories_fts is a virtual
+	// table, GORM's cascade rules don't reach it).
+	if err := tx.Exec(`DELETE FROM memories_fts WHERE persona_id = ?`, req.ID).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 500, err.Error())
+		return
+	}
 	if err := tx.Where("persona_id = ?", req.ID).
 		Delete(&model.Memory{}).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
+	}
+	// L2 scenes, L3 profile, per-persona pipeline + per-conv checkpoint
+	// rows — all are persona-scoped and must die with the persona.
+	if err := tx.Where("persona_id = ?", req.ID).
+		Delete(&model.MemoryScene{}).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 500, err.Error())
+		return
+	}
+	if err := tx.Where("persona_id = ?", req.ID).
+		Delete(&model.UserProfile{}).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 500, err.Error())
+		return
+	}
+	if err := tx.Where("persona_id = ?", req.ID).
+		Delete(&model.MemoryPipelineState{}).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 500, err.Error())
+		return
+	}
+	if err := tx.Where("persona_id = ?", req.ID).
+		Delete(&model.MemoryExtractCheckpoint{}).Error; err != nil {
+		fail(c, http.StatusInternalServerError, 500, err.Error())
+		return
+	}
+	// FTS index for messages in deleted conversations.
+	if len(convIDs) > 0 {
+		if err := tx.Exec(`DELETE FROM messages_fts WHERE conversation_id IN ?`, convIDs).Error; err != nil {
+			fail(c, http.StatusInternalServerError, 500, err.Error())
+			return
+		}
 	}
 	if err := tx.Where("id = ? AND user_id = ?", req.ID, uid).
 		Delete(&model.Persona{}).Error; err != nil {

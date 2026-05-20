@@ -34,12 +34,11 @@ type User struct {
 // LLMConfig stores OpenAI-compatible endpoints and credentials.
 type LLMConfig struct {
 	BaseModel
-	UserID         string `gorm:"index;size:36;not null" json:"user_id"`
-	Name           string `gorm:"size:64;not null" json:"name"`
-	BaseURL        string `gorm:"size:255;not null" json:"base_url"`
-	APIKeyEnc      string `gorm:"type:text" json:"-"` // encrypted
-	ChatModel      string `gorm:"size:128;not null" json:"chat_model"`
-	EmbeddingModel string `gorm:"size:128" json:"embedding_model"`
+	UserID    string `gorm:"index;size:36;not null" json:"user_id"`
+	Name      string `gorm:"size:64;not null" json:"name"`
+	BaseURL   string `gorm:"size:255;not null" json:"base_url"`
+	APIKeyEnc string `gorm:"type:text" json:"-"` // encrypted
+	ChatModel string `gorm:"size:128;not null" json:"chat_model"`
 	// Temperature has no GORM `default:` tag on purpose: with `default:` set,
 	// GORM omits zero values from the INSERT statement so the database default
 	// kicks in — which silently rewrites an explicitly requested
@@ -152,16 +151,105 @@ type Message struct {
 	ToolResult string `gorm:"type:text" json:"tool_result,omitempty"`
 }
 
-// Memory is one long-term memory fragment for a persona.
+// Memory is an L1 atomic memory record extracted from conversations.
+//
+// Kind taxonomy (TencentDB-Agent-Memory inspired):
+//   - persona: stable user attributes ("用户喜欢手冲咖啡")
+//   - episodic: dated events ("用户 2026-05-19 完成了项目交付")
+//   - instruction: long-term behavior rules for AI ("以后都叫我猫猫")
+//
+// The legacy kinds (fact/preference/event/summary) are still readable for
+// rows written by older builds; the extractor now only emits the three above.
+//
+// Vector embeddings are GONE — retrieval is now BM25 (over `memories_fts`)
+// plus LLM-driven hierarchical summarization (L2 scene / L3 user profile).
 type Memory struct {
 	BaseModel
 	PersonaID       string `gorm:"index;size:36;not null" json:"persona_id"`
 	ConversationID  string `gorm:"size:36" json:"conversation_id"`
-	Kind            string `gorm:"size:32;default:fact" json:"kind"` // fact/preference/event/summary
+	Kind            string `gorm:"size:32;default:persona" json:"kind"`
 	Content         string `gorm:"type:text" json:"content"`
-	Embedding       []byte `gorm:"type:blob" json:"-"`
 	Importance      int    `gorm:"default:5" json:"importance"`
 	SourceMessageID string `gorm:"size:36" json:"source_message_id"`
+	// SceneID is the L2 scene this atom belongs to. Empty until the L2
+	// extractor has run on it.
+	SceneID string `gorm:"index;size:36" json:"scene_id"`
+	// ActivityStart / ActivityEnd are only meaningful for `episodic`
+	// memories where the extractor could nail down absolute times.
+	ActivityStart *time.Time `json:"activity_start,omitempty"`
+	ActivityEnd   *time.Time `json:"activity_end,omitempty"`
+	// Metadata is a free-form JSON blob for future expansion (e.g.
+	// extractor-provided tags). Always emitted by the API even when empty.
+	Metadata string `gorm:"type:text" json:"metadata"`
+	// Status tracks soft-delete / merge state:
+	//   active     — live, returned by retrieval
+	//   superseded — replaced by another atom (see SupersededBy)
+	//   archived   — soft-deleted by user / janitor
+	Status       string `gorm:"size:16;default:active;index" json:"status"`
+	SupersededBy string `gorm:"size:36" json:"superseded_by,omitempty"`
+}
+
+// MemoryScene is an L2 thematic block grouping related L1 atoms. The LLM
+// extractor maintains these via a "fit-or-create-or-merge" loop with a hard
+// cap (default 15) to force consolidation as the user accumulates memories.
+type MemoryScene struct {
+	BaseModel
+	PersonaID  string     `gorm:"index;size:36;not null" json:"persona_id"`
+	Title      string     `gorm:"size:128;not null" json:"title"` // "AI 在和 X 讨论 Y"
+	Summary    string     `gorm:"type:text" json:"summary"`       // one-liner for system-prompt index
+	Content    string     `gorm:"type:text" json:"content"`       // full markdown body
+	Heat       int        `gorm:"default:0" json:"heat"`          // recall counter
+	AtomCount  int        `gorm:"default:0" json:"atom_count"`
+	LastAtomAt *time.Time `json:"last_atom_at,omitempty"`
+}
+
+// UserProfile is the L3 synthesized portrait of the USER (not the AI).
+// One row per persona. Injected verbatim into every system prompt as a stable
+// "who is this user" preamble. Bounded to ~2000 chars to keep prompts cheap.
+type UserProfile struct {
+	BaseModel
+	PersonaID       string    `gorm:"uniqueIndex;size:36;not null" json:"persona_id"`
+	Content         string    `gorm:"type:text" json:"content"` // markdown
+	SceneCountAtGen int       `json:"scene_count_at_gen"`
+	AtomsAtGen      int       `json:"atoms_at_gen"`
+	GeneratedAt     time.Time `json:"generated_at"`
+	RequestReason   string    `gorm:"size:255" json:"request_reason"`
+}
+
+// MemoryPipelineState tracks per-persona state for L3 user-profile generation
+// (counters that aggregate across all conversations of one persona, plus the
+// L3 cool-down). Per-conversation watermarks live in MemoryExtractCheckpoint
+// instead — a persona usually has multiple WeChat peers, each with its own
+// message stream and warmup curve, so the L1/L2 extraction checkpoint must
+// be keyed at conversation granularity.
+type MemoryPipelineState struct {
+	PersonaID              string    `gorm:"primaryKey;size:36" json:"persona_id"`
+	AtomsSinceLastProfile  int       `json:"atoms_since_last_profile"`
+	ScenesSinceLastProfile int       `json:"scenes_since_last_profile"`
+	LastL3At               time.Time `json:"last_l3_at"`
+	RequestProfileUpdate   bool      `json:"request_profile_update"`
+	ProfileUpdateReason    string    `gorm:"size:255" json:"profile_update_reason"`
+	UpdatedAt              time.Time `json:"updated_at"`
+}
+
+// MemoryExtractCheckpoint is a per-(persona, conversation) watermark that
+// drives L1 extraction and L2 scene fitting. A single persona can have many
+// concurrent WeChat conversations; each carries its own warmup curve and
+// last-extracted message id so the pipeline doesn't accidentally skip /
+// reprocess messages when several threads interleave.
+//
+// NextThreshold drives the warmup ramp: 1 → 2 → 4 → 8 → 16 → 16 ... per
+// conversation. Once a conversation hits 16, every subsequent batch waits for
+// 16 fresh messages or the idle timeout, whichever comes first.
+type MemoryExtractCheckpoint struct {
+	PersonaID              string    `gorm:"primaryKey;size:36" json:"persona_id"`
+	ConversationID         string    `gorm:"primaryKey;size:36" json:"conversation_id"`
+	LastExtractedMessageID string    `gorm:"size:36" json:"last_extracted_message_id"`
+	TotalProcessed         int       `json:"total_processed"`
+	LastL1At               time.Time `json:"last_l1_at"`
+	LastL2At               time.Time `json:"last_l2_at"`
+	NextThreshold          int       `gorm:"default:1" json:"next_threshold"`
+	UpdatedAt              time.Time `json:"updated_at"`
 }
 
 // Attachment for downloaded media.
@@ -227,6 +315,10 @@ func AllModels() []interface{} {
 		&Conversation{},
 		&Message{},
 		&Memory{},
+		&MemoryScene{},
+		&UserProfile{},
+		&MemoryPipelineState{},
+		&MemoryExtractCheckpoint{},
 		&Attachment{},
 		&SystemSetting{},
 		&MCPServer{},

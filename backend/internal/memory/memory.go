@@ -1,12 +1,26 @@
+// Package memory implements the long-term memory pyramid:
+//
+//	L0 Conversation  →  L1 Atom  →  L2 Scene  →  L3 User Profile
+//
+// All retrieval goes through BM25 (no vector embeddings — the user only
+// needs a chat-capable LLM). The LLM itself does:
+//
+//   - L1 extraction (raw messages → persona / episodic / instruction atoms)
+//   - L1 dedup (batch store / skip / update / merge decisions)
+//   - L2 scene grouping (which atom belongs to which thematic block, with a
+//     hard cap of 15 scenes per persona)
+//   - L3 profile synthesis (a single markdown narrative of the user, ≤2000
+//     chars, re-generated on threshold / cold-start / explicit request)
+//
+// `memory.Service` is the public surface used by the engine and HTTP
+// handlers. The extractor / dedup / scene / profile helpers in their own
+// files do the heavy LLM lifting and call back into Service for storage.
 package memory
 
 import (
 	"context"
-	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 	"time"
@@ -17,264 +31,421 @@ import (
 	"github.com/opentheone/opentheone/backend/internal/model"
 )
 
-// Service is the long-term memory layer (extract / dedupe / retrieve).
-type Service struct {
-	db *gorm.DB
-}
-
-func NewService(db *gorm.DB) *Service {
-	return &Service{db: db}
-}
-
-// encodeVector serializes []float32 to little-endian bytes.
-func encodeVector(v []float32) []byte {
-	buf := make([]byte, 4*len(v))
-	for i, x := range v {
-		binary.LittleEndian.PutUint32(buf[4*i:], math.Float32bits(x))
-	}
-	return buf
-}
-
-func decodeVector(b []byte) []float32 {
-	n := len(b) / 4
-	out := make([]float32, n)
-	for i := 0; i < n; i++ {
-		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[4*i:]))
-	}
-	return out
-}
-
-func cosine(a, b []float32) float64 {
-	if len(a) != len(b) || len(a) == 0 {
-		return 0
-	}
-	var dot, na, nb float64
-	for i := range a {
-		dot += float64(a[i]) * float64(b[i])
-		na += float64(a[i]) * float64(a[i])
-		nb += float64(b[i]) * float64(b[i])
-	}
-	if na == 0 || nb == 0 {
-		return 0
-	}
-	return dot / (math.Sqrt(na) * math.Sqrt(nb))
-}
-
-// candidateLimit caps the SQL pre-filter so brute-force cosine stays cheap.
-// At 1536-dim float32, 300 rows ≈ 1.8MB working set — plenty for typical user
-// scale without needing sqlite-vec / faiss.
+// candidateLimit caps the SQL pre-filter when no BM25 hit narrows the set.
+// At ~100 bytes per row, 300 rows ≈ 30 KB working set — trivial.
 const candidateLimit = 300
 
-// Retrieve returns up to topK memories most relevant to query, scoped to the
-// given persona. Same as RetrieveForConversation with no conversation boost.
-func (s *Service) Retrieve(ctx context.Context, llmClient *llm.Client, personaID, query string, topK int) ([]model.Memory, error) {
-	return s.RetrieveForConversation(ctx, llmClient, personaID, "", query, topK)
+// dedupCandidateLimit is the per-new-atom cap when assembling the unified
+// candidate pool we feed into the LLM dedup prompt. Keeps the prompt token
+// budget bounded even if the user has thousands of accumulated atoms.
+const dedupCandidateLimit = 8
+
+// Service is the long-term memory layer.
+type Service struct {
+	db   *gorm.DB
+	bm25 *BM25
 }
 
-// RetrieveForConversation does Mem0-style hybrid retrieval:
-//  1. SQL pre-filter by persona_id, ordered by importance + recency (no full table scan).
-//  2. In-memory cosine on the up-to-`candidateLimit` candidates, with two boosts:
-//     - importance: +0.02 * importance (already validated in prior rounds)
-//     - same-conversation locality: +0.05 when m.conversation_id == currentConversationID
-//     - age decay: ×0.95 once a memory is older than 30 days (gentle, not punishing)
+// NewService returns a memory.Service. EnsureSchema must have been called on
+// the same DB before any Ingest/Retrieve call (store.Open does this for us).
+func NewService(db *gorm.DB) *Service {
+	return &Service{db: db, bm25: NewBM25(db)}
+}
+
+// DB exposes the underlying GORM handle for helpers in this package
+// (extractor / dedup / scene / profile) without forcing them all through
+// Service methods. Not exported because we don't want external callers
+// reaching around the abstraction.
+func (s *Service) DB() *gorm.DB { return s.db }
+
+// BM25 exposes the FTS5 index handle for the same reason.
+func (s *Service) BM25() *BM25 { return s.bm25 }
+
+// ============================================================================
+// Retrieval
+// ============================================================================
+
+// RetrieveForConversation returns up to `topK` memory atoms most relevant to
+// `query`, scoped to one persona. The scoring combines:
 //
-// When the LLM client has no embedding model, falls back to importance + recency.
+//   - BM25 keyword match (primary signal — comes from FTS5 over the
+//     bigram-tokenized `tokens` column)
+//   - importance boost (+0.05 × importance, 1-10 scale)
+//   - conversation locality (+0.3 when the atom was last reinforced in this
+//     conversation — promotes "what you just told me five turns ago")
+//   - age decay (× 0.85 once the atom is > 30 days old; gentle, not punishing)
+//
+// When BM25 returns nothing (no overlap between query tokens and index),
+// we fall back to importance/recency ordering — the user still gets a
+// "highest-importance memories" injection, just not tailored to the query.
+//
+// `llmClient` is accepted for API compatibility with the old Mem0-style
+// implementation but is no longer used at the retrieval path. We keep it on
+// the signature so engine.go doesn't need to thread a different value in
+// just for retrieval; future LLM-based reranking can drop in here without
+// another signature churn.
 func (s *Service) RetrieveForConversation(ctx context.Context, llmClient *llm.Client, personaID, conversationID, query string, topK int) ([]model.Memory, error) {
+	_ = llmClient // see godoc above
 	if topK <= 0 {
 		topK = 5
 	}
-	// Pre-filter at SQL level. Order: importance desc, then created_at desc.
-	// The composite sort lets the index on (persona_id, created_at) still help
-	// because we filter by persona_id; the importance tie-breaker is cheap.
+	hits, err := s.bm25.SearchMemories(ctx, personaID, query, topK*4)
+	if err != nil {
+		return nil, err
+	}
+	if len(hits) == 0 {
+		// Cold path: no keyword overlap. Return top-K by importance/recency
+		// so the LLM still gets _something_ resembling the user's profile.
+		var rows []model.Memory
+		if err := s.db.WithContext(ctx).
+			Where("persona_id = ? AND status = ?", personaID, "active").
+			Order("importance desc, created_at desc").
+			Limit(topK).
+			Find(&rows).Error; err != nil {
+			return nil, err
+		}
+		return rows, nil
+	}
+
+	// Hydrate hit IDs into full Memory rows. We need the boost-relevant
+	// columns (importance, conversation_id, created_at).
+	ids := make([]string, 0, len(hits))
+	for _, h := range hits {
+		ids = append(ids, h.MemoryID)
+	}
 	var rows []model.Memory
 	if err := s.db.WithContext(ctx).
-		Where("persona_id = ?", personaID).
-		Order("importance desc, created_at desc").
-		Limit(candidateLimit).
+		Where("id IN ? AND status = ?", ids, "active").
 		Find(&rows).Error; err != nil {
 		return nil, err
 	}
-	if len(rows) == 0 {
-		return nil, nil
-	}
-	if llmClient == nil {
-		return rows[:minInt(topK, len(rows))], nil
-	}
-	qv, err := llmClient.Embed(ctx, query)
-	if err != nil {
-		return rows[:minInt(topK, len(rows))], nil
+	byID := make(map[string]*model.Memory, len(rows))
+	for i := range rows {
+		byID[rows[i].ID] = &rows[i]
 	}
 
 	now := time.Now()
 	type scored struct {
-		idx   int
+		mem   *model.Memory
 		score float64
 	}
-	ranked := make([]scored, 0, len(rows))
-	for i := range rows {
-		if len(rows[i].Embedding) == 0 {
+	out := make([]scored, 0, len(hits))
+	for _, h := range hits {
+		m := byID[h.MemoryID]
+		if m == nil {
+			// Index ↔ DB drift (deleted row not yet expunged from FTS).
+			// Self-heal so the next query doesn't pay the same penalty.
+			_ = s.bm25.DeleteMemory(ctx, h.MemoryID)
 			continue
 		}
-		v := decodeVector(rows[i].Embedding)
-		sc := cosine(qv, v)
-		sc += 0.02 * float64(rows[i].Importance)
-		if conversationID != "" && rows[i].ConversationID == conversationID {
-			sc += 0.05
+		// FTS5 bm25() returns a NEGATIVE score where smaller (more
+		// negative) = more relevant. Convert to "larger = better" before
+		// boosting so the boost math reads naturally.
+		score := -h.Score
+		score += 0.05 * float64(m.Importance)
+		if conversationID != "" && m.ConversationID == conversationID {
+			score += 0.3
 		}
-		if age := now.Sub(rows[i].CreatedAt); age > 30*24*time.Hour {
-			sc *= 0.95
+		if age := now.Sub(m.CreatedAt); age > 30*24*time.Hour {
+			score *= 0.85
 		}
-		ranked = append(ranked, scored{i, sc})
+		out = append(out, scored{mem: m, score: score})
 	}
-	sort.Slice(ranked, func(i, j int) bool { return ranked[i].score > ranked[j].score })
+	sort.Slice(out, func(i, j int) bool { return out[i].score > out[j].score })
+	if len(out) > topK {
+		out = out[:topK]
+	}
+	result := make([]model.Memory, 0, len(out))
+	for _, s := range out {
+		result = append(result, *s.mem)
+	}
+	return result, nil
+}
 
-	limit := minInt(topK, len(ranked))
-	out := make([]model.Memory, 0, limit)
-	for i := 0; i < limit; i++ {
-		out = append(out, rows[ranked[i].idx])
+// Retrieve is the unscoped flavour (no conversation locality boost) — kept
+// for API surface compatibility with the prior implementation.
+func (s *Service) Retrieve(ctx context.Context, llmClient *llm.Client, personaID, query string, topK int) ([]model.Memory, error) {
+	return s.RetrieveForConversation(ctx, llmClient, personaID, "", query, topK)
+}
+
+// SearchMemories is the public BM25-search surface — used by the built-in
+// `memory_search` tool the LLM can call mid-turn.
+func (s *Service) SearchMemories(ctx context.Context, personaID, query string, limit int) ([]model.Memory, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	hits, err := s.bm25.SearchMemories(ctx, personaID, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(hits) == 0 {
+		return nil, nil
+	}
+	ids := make([]string, 0, len(hits))
+	for _, h := range hits {
+		ids = append(ids, h.MemoryID)
+	}
+	var rows []model.Memory
+	if err := s.db.WithContext(ctx).
+		Where("id IN ? AND status = ?", ids, "active").
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	// Preserve BM25 ordering rather than DB row order.
+	byID := make(map[string]*model.Memory, len(rows))
+	for i := range rows {
+		byID[rows[i].ID] = &rows[i]
+	}
+	out := make([]model.Memory, 0, len(hits))
+	for _, h := range hits {
+		if m := byID[h.MemoryID]; m != nil {
+			out = append(out, *m)
+		}
 	}
 	return out, nil
 }
 
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
+// ============================================================================
+// Ingest (manual + extractor entry point)
+// ============================================================================
 
-// Ingest pushes a memory bullet point: embed → dedupe → upsert.
-func (s *Service) Ingest(ctx context.Context, llmClient *llm.Client, personaID, conversationID, sourceMessageID, kind, content string, importance int) error {
+// IngestManual stores a single atom from the manual-add HTTP endpoint.
+// No LLM round-trip, just BM25-based "looks like a near-duplicate" check
+// — fast and predictable for UI use.
+func (s *Service) IngestManual(ctx context.Context, personaID, kind, content string, importance int) error {
 	content = strings.TrimSpace(content)
 	if content == "" {
-		return nil
+		return errors.New("memory: content required")
 	}
-	if importance <= 0 {
+	if importance <= 0 || importance > 10 {
 		importance = 5
 	}
-	var emb []byte
-	if llmClient != nil {
-		v, err := llmClient.Embed(ctx, content)
-		if err == nil {
-			emb = encodeVector(v)
-		}
-	}
+	kind = normaliseKind(kind)
 
-	if len(emb) > 0 {
-		// Bound the dedupe candidate set the same way Retrieve does. Beyond
-		// `candidateLimit`, a brand-new fact is statistically very unlikely to
-		// be a near-duplicate of an item we'd find only by scanning the long
-		// tail of low-importance / old memories.
-		var existing []model.Memory
-		if err := s.db.WithContext(ctx).
-			Where("persona_id = ?", personaID).
-			Order("importance desc, created_at desc").
-			Limit(candidateLimit).
-			Find(&existing).Error; err != nil {
-			return err
-		}
-		nv := decodeVector(emb)
-		for _, m := range existing {
-			if len(m.Embedding) == 0 {
-				continue
-			}
-			sim := cosine(nv, decodeVector(m.Embedding))
-			switch {
-			case sim >= 0.92:
-				return nil
-			case sim >= 0.78:
-				updated := m.Content + "\n• " + content
-				upd := map[string]interface{}{
-					"content":    updated,
-					"importance": maxInt(m.Importance, importance),
-				}
-				// Refresh the locality pointers to the most recent mention so
-				// the conversation boost in RetrieveForConversation reflects
-				// the place this fact was last reinforced, not where it was
-				// first observed (a memory that originated in conversation A
-				// but keeps getting validated in conversation B should boost
-				// B going forward).
-				if conversationID != "" {
-					upd["conversation_id"] = conversationID
-				}
-				if sourceMessageID != "" {
-					upd["source_message_id"] = sourceMessageID
-				}
-				return s.db.WithContext(ctx).Model(&model.Memory{}).
-					Where("id = ?", m.ID).
-					Updates(upd).Error
-			}
+	// Cheap BM25 dedup: if the top hit's first 40 chars exactly match the
+	// incoming text, treat as duplicate and bump importance instead of
+	// creating a second row. (Strict-match is intentional — the LLM dedup
+	// path in the auto-extract pipeline does the smarter version.)
+	hits, _ := s.bm25.SearchMemories(ctx, personaID, content, 3)
+	for _, h := range hits {
+		if normaliseForDedup(h.Content) == normaliseForDedup(content) {
+			return s.db.WithContext(ctx).Model(&model.Memory{}).
+				Where("id = ?", h.MemoryID).
+				Updates(map[string]interface{}{
+					"importance": gormGreater("importance", importance),
+				}).Error
 		}
 	}
 
 	mem := model.Memory{
-		PersonaID:       personaID,
-		ConversationID:  conversationID,
-		Kind:            kind,
-		Content:         content,
-		Embedding:       emb,
-		Importance:      importance,
-		SourceMessageID: sourceMessageID,
+		PersonaID:  personaID,
+		Kind:       kind,
+		Content:    content,
+		Importance: importance,
+		Status:     "active",
+		Metadata:   "{}",
 	}
-	return s.db.WithContext(ctx).Create(&mem).Error
+	if err := s.db.WithContext(ctx).Create(&mem).Error; err != nil {
+		return err
+	}
+	if err := s.bm25.IndexMemory(ctx, mem.ID, personaID, content); err != nil {
+		// Index failure mustn't lose the row — log via error return; caller
+		// usually treats this as best-effort.
+		return fmt.Errorf("memory: index manual atom: %w", err)
+	}
+	return nil
 }
 
-// FactItem is one bullet produced by ExtractFacts: a short third-person fact
-// (or preference / event / summary) plus an importance score 1–10.
-type FactItem struct {
-	Kind       string `json:"kind"`
-	Content    string `json:"content"`
-	Importance int    `json:"importance"`
+// InsertAtoms writes a batch of new atoms produced by the extractor/dedup
+// pipeline. Each atom has already been routed through the LLM dedup decision
+// — so this is a straight INSERT + FTS index pass, no per-row similarity
+// check.
+//
+// Returns the IDs of the rows that were actually created (some may have
+// been dropped due to empty content as a safety net).
+func (s *Service) InsertAtoms(ctx context.Context, atoms []AtomInsert) ([]string, error) {
+	out := make([]string, 0, len(atoms))
+	for _, a := range atoms {
+		content := strings.TrimSpace(a.Content)
+		if content == "" {
+			continue
+		}
+		kind := normaliseKind(a.Kind)
+		imp := a.Importance
+		if imp <= 0 || imp > 10 {
+			imp = 5
+		}
+		mem := model.Memory{
+			PersonaID:       a.PersonaID,
+			ConversationID:  a.ConversationID,
+			Kind:            kind,
+			Content:         content,
+			Importance:      imp,
+			SourceMessageID: a.SourceMessageID,
+			ActivityStart:   a.ActivityStart,
+			ActivityEnd:     a.ActivityEnd,
+			Metadata:        a.Metadata,
+			Status:          "active",
+		}
+		if mem.Metadata == "" {
+			mem.Metadata = "{}"
+		}
+		if err := s.db.WithContext(ctx).Create(&mem).Error; err != nil {
+			return out, err
+		}
+		_ = s.bm25.IndexMemory(ctx, mem.ID, a.PersonaID, content)
+		out = append(out, mem.ID)
+	}
+	return out, nil
 }
 
-const extractSystem = `You are an information-extraction module for a long-term memory.
-Given a short snippet of conversation between USER and ASSISTANT, output ONLY a JSON array
-of memory bullets that should be remembered LONG-TERM about the USER (preferences, facts,
-events, relationships, plans). DO NOT include trivial chit-chat.
-Each bullet:
-{"kind":"fact|preference|event|summary", "content":"... short third-person sentence ...", "importance": 1-10}
-If nothing is worth remembering output [].`
+// AtomInsert is the value shape used by InsertAtoms — kept in this package
+// (not the model package) so it doesn't leak to non-memory callers.
+type AtomInsert struct {
+	PersonaID       string
+	ConversationID  string
+	SourceMessageID string
+	Kind            string
+	Content         string
+	Importance      int
+	ActivityStart   *time.Time
+	ActivityEnd     *time.Time
+	Metadata        string
+}
 
-func (s *Service) ExtractFacts(ctx context.Context, llmClient *llm.Client, snippet string) ([]FactItem, error) {
-	if llmClient == nil {
-		return nil, errors.New("memory: llm client required for extraction")
+// UpdateAtomContent overwrites an atom's content (used by dedup `merge` /
+// `update` actions) and re-indexes the FTS row.
+func (s *Service) UpdateAtomContent(ctx context.Context, memoryID, newContent string, newImportance int, newKind string) error {
+	newContent = strings.TrimSpace(newContent)
+	if newContent == "" {
+		return errors.New("memory: cannot update to empty content")
 	}
-	reply, err := llmClient.Chat(ctx, []llm.ChatMessage{
-		{Role: "system", Content: extractSystem},
-		{Role: "user", Content: snippet},
-	})
-	if err != nil {
-		return nil, err
+	updates := map[string]interface{}{
+		"content": newContent,
 	}
-	reply = strings.TrimSpace(reply)
-	reply = stripCodeFence(reply)
-	if reply == "" || reply == "[]" {
+	if newImportance > 0 && newImportance <= 10 {
+		updates["importance"] = newImportance
+	}
+	if newKind != "" {
+		updates["kind"] = normaliseKind(newKind)
+	}
+	var existing model.Memory
+	if err := s.db.WithContext(ctx).Where("id = ?", memoryID).First(&existing).Error; err != nil {
+		return err
+	}
+	if err := s.db.WithContext(ctx).Model(&existing).Updates(updates).Error; err != nil {
+		return err
+	}
+	return s.bm25.IndexMemory(ctx, memoryID, existing.PersonaID, newContent)
+}
+
+// SupersedeAtoms marks a set of old atoms as superseded by a new one. The
+// FTS rows for the superseded atoms are dropped so retrieval ignores them
+// even if the SQL query forgets the status filter.
+func (s *Service) SupersedeAtoms(ctx context.Context, supersededIDs []string, newID string) error {
+	if len(supersededIDs) == 0 {
+		return nil
+	}
+	if err := s.db.WithContext(ctx).Model(&model.Memory{}).
+		Where("id IN ?", supersededIDs).
+		Updates(map[string]interface{}{
+			"status":        "superseded",
+			"superseded_by": newID,
+		}).Error; err != nil {
+		return err
+	}
+	for _, id := range supersededIDs {
+		_ = s.bm25.DeleteMemory(ctx, id)
+	}
+	return nil
+}
+
+// CandidatesForDedup builds the unified candidate pool for the LLM dedup
+// prompt: union of BM25 hits across all new-atom contents, deduplicated by
+// memory_id, capped at `dedupCandidateLimit × len(newAtoms)`.
+func (s *Service) CandidatesForDedup(ctx context.Context, personaID string, newContents []string) ([]model.Memory, error) {
+	seen := make(map[string]struct{})
+	ids := make([]string, 0)
+	for _, c := range newContents {
+		hits, err := s.bm25.SearchMemories(ctx, personaID, c, dedupCandidateLimit)
+		if err != nil {
+			return nil, err
+		}
+		for _, h := range hits {
+			if _, ok := seen[h.MemoryID]; ok {
+				continue
+			}
+			seen[h.MemoryID] = struct{}{}
+			ids = append(ids, h.MemoryID)
+		}
+	}
+	if len(ids) == 0 {
 		return nil, nil
 	}
-	var items []FactItem
-	if err := json.Unmarshal([]byte(reply), &items); err != nil {
-		return nil, fmt.Errorf("memory: cannot parse facts %q: %w", reply, err)
-	}
-	return items, nil
+	var rows []model.Memory
+	err := s.db.WithContext(ctx).
+		Where("id IN ? AND status = ?", ids, "active").
+		Find(&rows).Error
+	return rows, err
 }
 
-// stripCodeFence removes a single leading/trailing ``` block.
-func stripCodeFence(s string) string {
-	s = strings.TrimSpace(s)
-	if strings.HasPrefix(s, "```") {
-		nl := strings.Index(s, "\n")
-		if nl >= 0 {
-			s = s[nl+1:]
+// ============================================================================
+// Helpers
+// ============================================================================
+
+// normaliseKind maps legacy / shorthand kinds onto the canonical set
+// {persona, episodic, instruction}. Unknown values fall through to
+// `persona` (the safest "generic stable attribute" bucket).
+func normaliseKind(k string) string {
+	switch strings.ToLower(strings.TrimSpace(k)) {
+	case "persona", "preference", "fact":
+		return "persona"
+	case "episodic", "event":
+		return "episodic"
+	case "instruction", "rule":
+		return "instruction"
+	case "summary":
+		// Legacy summaries are kept as `persona` since the manual taxonomy
+		// is the closest semantic match (general user-related notes).
+		return "persona"
+	}
+	return "persona"
+}
+
+// normaliseForDedup squeezes a memory string into a "loose-equality"
+// canonical form for the manual-add dedup path. We strip whitespace and
+// punctuation, lowercase ASCII, and truncate to 80 runes so two atoms
+// that differ only in trailing chitchat are still caught.
+func normaliseForDedup(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			continue
 		}
-		s = strings.TrimSuffix(s, "```")
-		s = strings.TrimSpace(s)
+		if r == '.' || r == ',' || r == '!' || r == '?' || r == ';' ||
+			r == '：' || r == '，' || r == '。' || r == '！' || r == '？' {
+			continue
+		}
+		b.WriteRune(toLowerASCII(r))
 	}
-	return s
+	out := b.String()
+	if len([]rune(out)) > 80 {
+		runes := []rune(out)
+		out = string(runes[:80])
+	}
+	return out
 }
 
-func maxInt(a, b int) int {
-	if a > b {
-		return a
+func toLowerASCII(r rune) rune {
+	if r >= 'A' && r <= 'Z' {
+		return r + ('a' - 'A')
 	}
-	return b
+	return r
+}
+
+// gormGreater returns a GORM expression that updates a column to the greater
+// of (its current value, candidate). Used by IngestManual to "bump importance
+// up, never down" when re-adding the same atom.
+func gormGreater(col string, candidate int) interface{} {
+	return gorm.Expr("CASE WHEN ? > "+col+" THEN ? ELSE "+col+" END", candidate, candidate)
 }

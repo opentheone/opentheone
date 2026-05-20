@@ -7,7 +7,6 @@ interface LLMConfig {
   name: string;
   base_url: string;
   chat_model: string;
-  embedding_model: string;
   temperature: number;
   max_tokens: number;
   is_default: boolean;
@@ -20,8 +19,6 @@ interface Provider {
   name: string;
   base_url: string;
   chat_model: string;
-  embedding_model: string;
-  supports_embedding: boolean;
   signup_url: string;
   note: string;
 }
@@ -35,7 +32,6 @@ const emptyForm = () => ({
   base_url: "https://api.deepseek.com/v1",
   api_key: "",
   chat_model: "deepseek-v4-pro",
-  embedding_model: "",
   temperature: 0.8,
   max_tokens: 1024,
   is_default: false,
@@ -66,7 +62,6 @@ function applyPreset(p: Provider) {
   form.value.name = p.name;
   form.value.base_url = p.base_url;
   form.value.chat_model = p.chat_model;
-  form.value.embedding_model = p.embedding_model;
 }
 
 async function submit() {
@@ -97,7 +92,6 @@ function edit(c: LLMConfig) {
     base_url: c.base_url,
     api_key: "",
     chat_model: c.chat_model,
-    embedding_model: c.embedding_model,
     temperature: c.temperature,
     max_tokens: c.max_tokens,
     is_default: c.is_default,
@@ -212,10 +206,6 @@ onMounted(async () => {
           <input v-model="form.chat_model" class="input mt-1" placeholder="deepseek-v4-pro" />
         </div>
         <div>
-          <label class="label">Embedding 模型（可留空）</label>
-          <input v-model="form.embedding_model" class="input mt-1" placeholder="留空时长期记忆按时间排序" />
-        </div>
-        <div>
           <label class="label">Temperature</label>
           <input v-model.number="form.temperature" type="number" min="0" max="2" step="0.1" class="input mt-1" />
         </div>
@@ -251,7 +241,7 @@ onMounted(async () => {
               >API Key 已设置</span>
             </div>
             <div class="text-xs text-ink-400 mt-1">
-              {{ c.chat_model }} · embedding: {{ c.embedding_model || "无" }} · temp {{ c.temperature }}
+              {{ c.chat_model }} · temp {{ c.temperature }} · max {{ c.max_tokens }}
             </div>
             <div class="text-xs text-ink-500 truncate">{{ c.base_url }}</div>
           </div>

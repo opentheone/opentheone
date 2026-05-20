@@ -41,7 +41,7 @@ OpenTheOne 是一个**单二进制**的 Go 服务，把一个 LLM 角色"装"进
 | **单进程优先** | 不引入消息队列 / Redis / 多服务，全部在一个 Go 二进制里跑 |
 | **SQLite 默认** | 个人 / 朋友圈规模够用，零运维；切换 Postgres 留接口但不是默认 |
 | **GORM AutoMigrate** | 只增字段，永不删 / rename，老库平滑升级 |
-| **不重复造轮子** | LLM 调用统一走 OpenAI 兼容协议；记忆系统借鉴 Mem0；摘要借鉴 LangChain |
+| **不重复造轮子** | LLM 调用统一走 OpenAI 兼容协议；记忆系统借鉴 TencentDB-Agent-Memory 的四层金字塔；摘要借鉴 LangChain |
 | **失败要响** | fire-and-forget 的 goroutine 必须 `defer recover()`，HTTP 层用统一的 `code/msg/data` 响应壳 |
 
 ---
@@ -87,7 +87,7 @@ OpenTheOne 是一个**单二进制**的 Go 服务，把一个 LLM 角色"装"进
 | `internal/ilink` | 微信 ClawBot / iLink HTTP + CDN AES-128-ECB | 字段必须对照官方文档，不要"猜" |
 | `internal/runner` | 每个 binding 一个长轮询 goroutine + QR 扫码协调 | panic-safe；ctx 由 Manager 持有 |
 | `internal/engine` | 对话核心：组装 prompt / 调 LLM / 切分 / 发送 / 入库 | 业务规则集中地；handler 不绕过它 |
-| `internal/memory` | Mem0 风格的抽取 / 去重 / 两阶段检索 | 没 embedding 时降级时间序 |
+| `internal/memory` | 长期记忆金字塔 L0→L1→L2→L3：BM25 关键词检索 + LLM 抽取/去重/场景归类/画像 | **无 embedding**，依赖 SQLite FTS5（构建必须带 `-tags sqlite_fts5`）|
 | `internal/proactive` | robfig/cron 调度，按 persona 的 cron 触发主动消息 | 一个 persona 一个 entry |
 | `internal/handler` | gin 路由 handler；做参数校验和响应包装 | 业务逻辑放 engine / memory |
 | `internal/middleware` | JWT、AdminOnly、登录限流 (sliding window) | 限流器有 Cleanup janitor |
@@ -112,19 +112,23 @@ engine.HandleInbound:
    2. 落 inbound message 行（消息体 + context_token）
    3. 异步 goroutine 下载图片 / 语音 / 文件附件
    4. 取 persona 的 LLM 配置 → 解密 APIKey
-   5. 检索长期记忆 (memory.Retrieve top-K)
-   6. 组装 prompt:
-        system  = persona.system_prompt
-                + rolling_summary（若有）
-                + 记忆 bullets
-                + 风格 / cron 提示
-        history = 最近 N 条对话 (不含已被摘要的)
-        user    = 当前 inbound text
-   7. llm.Chat → 拿到回复
+   5. 组装 prompt（buildSystemPrompt → header 缓存友好）:
+        system 头部（稳定）= persona.system_prompt
+                          + L3 用户画像 (mem.ProfileForPrompt)
+                          + L2 主题场景索引 (mem.SceneIndexForPrompt)
+                          + 内置工具说明
+        system 动态段     = rolling_summary（若有）
+                          + L1 BM25 召回 (mem.RetrieveForConversation top-K)
+        history          = 最近 N 条对话 (不含已被摘要的)
+        user             = 当前 inbound text
+   6. 工具列表 = 内置工具 (oto_memory_search / oto_scene_read /
+                          oto_conversation_search) + MCP 工具
+   7. agent loop（流式 chat completion + tool 路由）→ 最终回复
    8. engine.splitForChunks → 拆成 ≤ maxChunk 字的段
    9. 逐段 ilink.SendMessage（用 context_token），中间 SendTyping
-  10. 每段都落 outbound message 行
-  11. 异步 goroutine: memory.IngestSnippet（抽取新事实）
+  10. 每段都落 outbound message 行 + FTS 索引（memories_fts / messages_fts）
+  11. 异步触发：memory.Pipeline.Trigger（按 warmup / 阈值 / idle / cold-start 决定）
+       → L1 抽取 → LLM dedup → L2 场景归类 → 视需要重生成 L3 画像
   12. 异步 goroutine: engine.MaybeSummarize（必要时滚动摘要）
 ```
 
@@ -156,7 +160,6 @@ AutoMigrate 自动建表。完整定义在
 | `base_url` | varchar(255) | OpenAI 兼容 endpoint |
 | `api_key_enc` | text | **AES-256-GCM 加密** |
 | `chat_model` | varchar(128) | 例 `deepseek-v4-pro` |
-| `embedding_model` | varchar(128) | 留空则记忆走时间序降级 |
 | `temperature` | float | 默认 0.8 |
 | `max_tokens` | int | 默认 1024 |
 | `is_default` | bool | 同 user 内只有一个 true |
@@ -229,19 +232,95 @@ AutoMigrate 自动建表。完整定义在
 
 > `tool_call` / `tool_result` 是 agent loop 留下的**审计行**：不会通过 iLink 发出去、不参与滚动摘要、也不进长期记忆抽取；仅供"对话详情"页折叠展示，让用户能看到 AI 这一轮调用了哪些工具、入参/结果是什么。新增字段都是只增列，老库 GORM AutoMigrate 直接兼容。
 
-### 3.7 `memories`
+### 3.7 `memories`（L1 原子记忆）
 
 | 字段 | 类型 | 备注 |
 |---|---|---|
 | `persona_id` | UUID | 隔离 |
 | `conversation_id` | UUID | 来源会话（用于局部性加权） |
-| `kind` | varchar(32) | `fact` / `preference` / `event` / `summary` |
-| `content` | text | 第三人称的短句 |
-| `embedding` | blob | float32[] little-endian，长度 = embedding model 维度 |
+| `kind` | varchar(32) | `persona`（稳定属性）/ `episodic`（事件）/ `instruction`（对 AI 长期指令）；老库残留的 `fact`/`preference`/`event`/`summary` 仍可读 |
+| `content` | text | 第三人称陈述句 |
 | `importance` | int | 1-10，由 LLM 估计 |
 | `source_message_id` | UUID | 抽取出该记忆的入站消息 |
+| `scene_id` | UUID | 归属的 L2 主题场景；空字符串表示尚未归类 |
+| `activity_start` / `activity_end` | time | 仅 `episodic` 类有；LLM 能确定时间时填 |
+| `metadata` | text | JSON，预留扩展位 |
+| `status` | varchar(16) | `active` / `superseded` / `archived` |
+| `superseded_by` | UUID | 被合并替代时指向新行 |
 
-### 3.8 `attachments`
+**不再存 embedding**：长期记忆检索改走 BM25（SQLite FTS5）+ LLM 排序，所以这张表
+也没有 `embedding` 列。详见 §4.2。
+
+### 3.8 `memory_scenes`（L2 主题场景）
+
+| 字段 | 类型 | 备注 |
+|---|---|---|
+| `persona_id` | UUID | 隔离，**每 persona 上限 15 个**（`memory.MaxScenesPerPersona`） |
+| `title` | varchar(128) | 主动叙述，如「AI 在和用户聊咖啡」 |
+| `summary` | text | 一句话场景说明（≤40 字），会拼到 system prompt 头部 |
+| `content` | text | markdown 主体（保留扩展位，目前不强制写） |
+| `heat` | int | 召回计数；scene_read 一次 +1 |
+| `atom_count` | int | 归属其下的活跃 atom 数量 |
+| `last_atom_at` | time | 最后一次有新 atom 进来的时间 |
+
+### 3.9 `user_profiles`（L3 用户画像）
+
+每个 persona 一行；由 LLM 把所有 L1/L2 汇总成的简洁画像。
+
+| 字段 | 类型 | 备注 |
+|---|---|---|
+| `persona_id` | UUID UNIQUE | 一对一 |
+| `content` | text | markdown，≤2000 字（`memory.MaxProfileChars`） |
+| `scene_count_at_gen` / `atoms_at_gen` | int | 生成时的来源规模，方便追溯 |
+| `generated_at` | time | |
+| `request_reason` | varchar(255) | `cold-start` / `atom-threshold` / `scene-threshold` / `manual` |
+
+### 3.10 `memory_pipeline_states`（L3 画像调度状态，每 persona 1 行）
+
+只承载「跨所有会话累加的 L3 画像」相关计数与冷却字段。L1/L2 的逐会话
+checkpoint 拆到下一张表里。
+
+| 字段 | 类型 | 备注 |
+|---|---|---|
+| `persona_id` | UUID PK | |
+| `atoms_since_last_profile` / `scenes_since_last_profile` | int | 触发 L3 重生的计数器 |
+| `last_l3_at` | time | 上次 L3 完成时间，配合 6h 冷却窗口 |
+| `request_profile_update` / `profile_update_reason` | bool / text | 外部（如手动按钮）请求 L3 重生时置位 |
+
+### 3.11 `memory_extract_checkpoints`（L1/L2 抽取 watermark，每 persona+conv 1 行）
+
+一个 persona 通常对接多个微信好友，每个好友是一条独立的 conversation。
+warmup 曲线、最后处理到哪条消息这类「按消息流推进」的状态必须按
+conversation 维度记录，否则一个高频好友会把 watermark 一直往前推，
+把另一个安静好友的「未处理消息计数」整体算错。
+
+| 字段 | 类型 | 备注 |
+|---|---|---|
+| `persona_id` | UUID PK | |
+| `conversation_id` | UUID PK | |
+| `last_extracted_message_id` | UUID | 上次 L1 抽取覆盖到的最后一条消息（按 `created_at` 比对，dangling 行会被 `COALESCE(..., '1970-01-01')` 兜底为「无 watermark」）|
+| `total_processed` | int | 累计已处理消息数 |
+| `last_l1_at` / `last_l2_at` | time | 该会话最后一次 L1 / L2 运行的时刻 |
+| `next_threshold` | int | warmup 曲线：1 → 2 → 4 → 8 → 16 → 16…（按会话独立计算）|
+
+> 删除 conversation 时这张表的对应行会被一并清空（`handler/conversation.Delete`），
+> 否则被删的 `last_extracted_message_id` 会变成悬空引用。删除 persona
+> 时同样会清掉这个 persona 的所有 checkpoint 行。
+
+### 3.12 FTS5 虚拟表（不出现在 `model.AllModels()`）
+
+`memory.EnsureSchema` 在 AutoMigrate 后用裸 DDL 创建。**必须以 `-tags
+sqlite_fts5` 编译**，否则启动时报 `no such module: fts5`。
+
+| 表 | 列 | 用途 |
+|---|---|---|
+| `memories_fts` | `memory_id`, `persona_id`, `content`, `tokens` | L1 原子的 BM25 索引；`tokens` 是 bigram 切分后的串 |
+| `messages_fts` | `message_id`, `conversation_id`, `text`, `tokens` | 历史聊天消息的 BM25 索引；`oto_conversation_search` 工具用 |
+
+中文分词走 `memory.Tokenize`（纯 Go，零依赖的 bigram 滑窗 + ASCII 词），
+新写入由 `BM25.IndexMemory` / `IndexMessage` 同步维护。
+
+### 3.13 `attachments`
 
 | 字段 | 类型 | 备注 |
 |---|---|---|
@@ -251,14 +330,14 @@ AutoMigrate 自动建表。完整定义在
 | `size` | int64 | 字节 |
 | `mime` | varchar(64) | |
 
-### 3.9 `system_settings`
+### 3.14 `system_settings`
 
 | 字段 | 类型 | 备注 |
 |---|---|---|
 | `key` | varchar(64) UNIQUE | 当前唯一一项 `allow_register` |
 | `value` | text | 文本，业务侧自己解释成 bool / int |
 
-### 3.10 `mcp_servers`
+### 3.15 `mcp_servers`
 
 一行 = 一个用户配置的 MCP（Model Context Protocol）服务。
 
@@ -307,19 +386,92 @@ Engine 默认参数（可通过 `engine.Options` 调）：
 `RebuildSummary`（用户手动触发）用阻塞 `Lock` 抢。两者都会**重新从 DB 拉
 最新水位线**，防止覆盖竞争窗口里另一个协程已经写好的摘要。
 
-### 4.2 长期记忆：两阶段检索
+### 4.2 长期记忆：BM25 + 分层金字塔
 
-`memory.Retrieve(personaID, conversationID, query, k)`：
+记忆系统已完全去掉向量 embedding，改走「LLM 主导 + BM25 检索 + 分层
+汇总」的金字塔结构：
 
-1. **SQL 预筛**：按 persona 取 top-300，排序 `importance DESC, created_at DESC`。
-2. **内存重排**：把 query 通过 embedding model 拿到一个 float32 向量，逐条
-   计算余弦相似度，并叠加：
-   - 会话局部性加权：来自同一 conversation 的 memory，分数 ×1.2。
-   - 时间衰减：`exp(-Δdays / 30)`，越新越加分。
-3. 返回 top-K。
+```
+L0  原始对话消息（messages 表 + messages_fts 索引）
+   │ 抽取 (memory.ExtractAtoms，中文 prompt)
+   ▼
+L1  原子记忆 atom（memories 表 + memories_fts 索引）
+       kind ∈ {persona, episodic, instruction}
+   │ LLM 冲突判定 (memory.DedupExtracted: store / skip / update / merge)
+   │ 场景归类   (memory.FitAtomsToScenes：fit / create / merge_then_create)
+   ▼
+L2  主题场景 scene（memory_scenes，上限 15）
+   │ 触发：累计 atom / scene 达阈值，或手动
+   ▼
+L3  用户画像 profile（user_profiles，单行，≤2000 字）
+```
 
-若 LLM 配置里 `embedding_model` 为空 → 走纯时间序降级，返回最近 K 条。
-**这是有意的"无 embedding 也能用"路径**，不应被移除。
+#### 4.2.1 `memory.RetrieveForConversation(personaID, convID, query, k)`
+
+1. `BM25.SearchMemories(personaID, query, k*4)`：FTS5 bm25() 排序，候选 ≤ 4k 条。
+2. 内存重排（更便宜的本地计算，无需 LLM）：
+   - 反号化 bm25 分数（FTS5 越小越相关 → 翻成「越大越好」）。
+   - `+ 0.05 × importance`（1-10）。
+   - 会话局部性：来自同一 conversation 的 +0.3。
+   - 老化：`age > 30 天` 时分数 `×0.85`。
+3. 截到 top-K 返回。
+
+若 BM25 没命中（查询里没有 CJK 二元组 / 没有 ASCII 词与索引交集），fallback
+回 `importance DESC, created_at DESC` 取 top-K——「冷查询也要返回点东西」。
+
+#### 4.2.2 写入路径
+
+| 入口 | 路径 | 是否调 LLM |
+|---|---|---|
+| 手动添加（前端） | `Service.IngestManual` → BM25 严格同名去重 → 写表 + FTS | 否 |
+| 自动 pipeline | `Pipeline.runOneCycle`：拉 L0 → `ExtractAtoms` → BM25 候选 → `DedupExtracted` → `ApplyDedupActions`（事务）→ `FitAtomsToScenes` | 是（3 次） |
+| 手动重生画像 | `/api/profile/regenerate` → `RegenerateProfile` | 是（1 次） |
+
+#### 4.2.3 内置工具（始终对 LLM 可见）
+
+agent loop 把这 3 个工具与 MCP 工具并列暴露给 LLM：
+
+| 工具 | 作用 |
+|---|---|
+| `oto_memory_search(query, limit)` | L1 原子记忆 BM25 搜索 |
+| `oto_scene_read(scene_id)` | 读取一个 L2 场景的完整内容 + 归属 atom |
+| `oto_conversation_search(query, limit)` | 当前会话内 L0 消息原文 BM25 搜索 |
+
+定义在 `engine/builtin_tools.go::builtinTools`；执行路径在
+`Engine.invokeBuiltinTool`。
+
+#### 4.2.4 异步 pipeline 调度
+
+`memory.Pipeline`（`engine.AttachPipeline` 注入）按 (persona, conversation)
+隔离的方式异步处理（同 persona 的不同会话可并发；L3 画像在 persona 维度
+另上一把 `profileMu` 串行）。决策来自 `memory_extract_checkpoints.next_threshold`
+（每 persona+conv 独立的 warmup 曲线）：
+
+- **warmup** 曲线：刚开始 1 条就触发，然后 2 → 4 → 8 → 16，之后稳定 16。
+- **threshold**：累计未处理消息 ≥ `next_threshold` → 触发。
+- **idle**：超过 5 分钟无新消息但仍有积压 → flush。
+- **cold-start**：进程启动后第一次见到这个 persona → 触发。
+- **explicit**：`Pipeline.TriggerExplicit` 由 UI 按钮直接调用。
+
+L3 画像有额外的 6 小时冷却 + 每 20 个新 atom 或 3 个新 scene 才考虑重生。
+
+#### 4.2.5 缓存友好的 prompt 注入
+
+system prompt 头部按「稳定优先」排序——只要 L3 profile / L2 scene 索引
+不变，头部字符串就稳定，OpenAI 兼容协议的 prompt prefix cache 直接命中：
+
+```
+[稳定段]
+  persona system_prompt
+  L3 user profile
+  L2 scene index (≤15)
+  内置工具使用提示
+[动态段]
+  rolling summary
+  L1 BM25 召回结果（取决于当前 query）
+  最近 N 条对话原文
+  当前 user 消息
+```
 
 ### 4.3 消息切分
 
@@ -443,9 +595,14 @@ loop：
 | POST | `/api/conversation/delete` | 删除会话（级联消息） |
 | POST | `/api/conversation/rebuild_summary` | 用户触发的滚动摘要全量重算 |
 | POST | `/api/attachment/get` | 取附件二进制（base64 包到 JSON 里） |
-| POST | `/api/memory/list` | persona 的长期记忆 |
-| POST | `/api/memory/delete` | 删一条记忆 |
-| POST | `/api/memory/upsert_manual` | 手工写入一条记忆 |
+| POST | `/api/memory/list` | persona 的 L1 原子记忆（importance desc, recent first） |
+| POST | `/api/memory/delete` | 删一条 L1 记忆（同时清 BM25 索引行） |
+| POST | `/api/memory/upsert_manual` | 手工写入一条 L1 记忆（BM25 严格同名去重） |
+| POST | `/api/scene/list` | persona 的 L2 主题场景列表，返回 `max_scenes` |
+| POST | `/api/scene/get` | 拿单个场景 + 归属 atom；每次调用 heat +1 |
+| POST | `/api/scene/delete` | 删场景；atom 保留但 scene_id 被清空，等待下一轮 pipeline 重新归类 |
+| POST | `/api/profile/get` | 拿当前 L3 用户画像（`{ profile: null }` 表示还没生成） |
+| POST | `/api/profile/regenerate` | 手动触发 L3 重生（前端按钮用；普通流程是 pipeline 自动决定） |
 
 #### 仅 admin
 | Method | Path | 说明 |

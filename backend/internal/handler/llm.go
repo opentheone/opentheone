@@ -25,11 +25,10 @@ func NewLLMHandler(db *gorm.DB, secret string) *LLMHandler {
 }
 
 type llmCreateReq struct {
-	Name           string `json:"name"`
-	BaseURL        string `json:"base_url"`
-	APIKey         string `json:"api_key"`
-	ChatModel      string `json:"chat_model"`
-	EmbeddingModel string `json:"embedding_model"`
+	Name      string `json:"name"`
+	BaseURL   string `json:"base_url"`
+	APIKey    string `json:"api_key"`
+	ChatModel string `json:"chat_model"`
 	// Temperature is a pointer so the zero value (`0`, deterministic
 	// decoding — a perfectly valid request) is distinguishable from
 	// "field absent in body". The previous `float32` plus `== 0 ⇒ 0.8`
@@ -66,15 +65,14 @@ func (h *LLMHandler) Create(c *gin.Context) {
 	}
 
 	cfg := model.LLMConfig{
-		UserID:         uid,
-		Name:           req.Name,
-		BaseURL:        req.BaseURL,
-		APIKeyEnc:      enc,
-		ChatModel:      req.ChatModel,
-		EmbeddingModel: req.EmbeddingModel,
-		Temperature:    temp,
-		MaxTokens:      req.MaxTokens,
-		IsDefault:      req.IsDefault,
+		UserID:      uid,
+		Name:        req.Name,
+		BaseURL:     req.BaseURL,
+		APIKeyEnc:   enc,
+		ChatModel:   req.ChatModel,
+		Temperature: temp,
+		MaxTokens:   req.MaxTokens,
+		IsDefault:   req.IsDefault,
 	}
 	if err := h.db.Create(&cfg).Error; err != nil {
 		fail(c, http.StatusInternalServerError, 500, err.Error())
@@ -89,16 +87,15 @@ func (h *LLMHandler) Create(c *gin.Context) {
 }
 
 type llmListItem struct {
-	ID             string  `json:"id"`
-	Name           string  `json:"name"`
-	BaseURL        string  `json:"base_url"`
-	ChatModel      string  `json:"chat_model"`
-	EmbeddingModel string  `json:"embedding_model"`
-	Temperature    float32 `json:"temperature"`
-	MaxTokens      int     `json:"max_tokens"`
-	IsDefault      bool    `json:"is_default"`
-	APIKeySet      bool    `json:"api_key_set"`
-	CreatedAt      string  `json:"created_at"`
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	BaseURL     string  `json:"base_url"`
+	ChatModel   string  `json:"chat_model"`
+	Temperature float32 `json:"temperature"`
+	MaxTokens   int     `json:"max_tokens"`
+	IsDefault   bool    `json:"is_default"`
+	APIKeySet   bool    `json:"api_key_set"`
+	CreatedAt   string  `json:"created_at"`
 }
 
 func (h *LLMHandler) List(c *gin.Context) {
@@ -111,16 +108,15 @@ func (h *LLMHandler) List(c *gin.Context) {
 	out := make([]llmListItem, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, llmListItem{
-			ID:             r.ID,
-			Name:           r.Name,
-			BaseURL:        r.BaseURL,
-			ChatModel:      r.ChatModel,
-			EmbeddingModel: r.EmbeddingModel,
-			Temperature:    r.Temperature,
-			MaxTokens:      r.MaxTokens,
-			IsDefault:      r.IsDefault,
-			APIKeySet:      r.APIKeyEnc != "",
-			CreatedAt:      r.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+			ID:          r.ID,
+			Name:        r.Name,
+			BaseURL:     r.BaseURL,
+			ChatModel:   r.ChatModel,
+			Temperature: r.Temperature,
+			MaxTokens:   r.MaxTokens,
+			IsDefault:   r.IsDefault,
+			APIKeySet:   r.APIKeyEnc != "",
+			CreatedAt:   r.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 		})
 	}
 	ok(c, gin.H{"items": out})
@@ -133,12 +129,11 @@ func (h *LLMHandler) Providers(c *gin.Context) {
 }
 
 type llmUpdateReq struct {
-	ID             string `json:"id"`
-	Name           string `json:"name"`
-	BaseURL        string `json:"base_url"`
-	APIKey         string `json:"api_key"`
-	ChatModel      string `json:"chat_model"`
-	EmbeddingModel string `json:"embedding_model"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	BaseURL   string `json:"base_url"`
+	APIKey    string `json:"api_key"`
+	ChatModel string `json:"chat_model"`
 	// Temperature and MaxTokens are pointers so the zero value is
 	// distinguishable from "field absent". A user setting temperature=0
 	// (deterministic decoding) is a perfectly valid request; the previous
@@ -170,7 +165,6 @@ func (h *LLMHandler) Update(c *gin.Context) {
 	if req.ChatModel != "" {
 		updates["chat_model"] = req.ChatModel
 	}
-	updates["embedding_model"] = req.EmbeddingModel
 	if req.Temperature != nil && *req.Temperature >= 0 {
 		updates["temperature"] = *req.Temperature
 	}

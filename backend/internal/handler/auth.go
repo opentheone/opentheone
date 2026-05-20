@@ -256,15 +256,14 @@ func seedDefaultLLMConfig(db *gorm.DB, userID string) {
 	}
 	preset := llm.DefaultPreset()
 	cfg := model.LLMConfig{
-		UserID:         userID,
-		Name:           preset.Name,
-		BaseURL:        preset.BaseURL,
-		APIKeyEnc:      "",
-		ChatModel:      preset.ChatModel,
-		EmbeddingModel: preset.EmbeddingModel,
-		Temperature:    0.8,
-		MaxTokens:      1024,
-		IsDefault:      true,
+		UserID:      userID,
+		Name:        preset.Name,
+		BaseURL:     preset.BaseURL,
+		APIKeyEnc:   "",
+		ChatModel:   preset.ChatModel,
+		Temperature: 0.8,
+		MaxTokens:   1024,
+		IsDefault:   true,
 	}
 	_ = db.Create(&cfg).Error
 }

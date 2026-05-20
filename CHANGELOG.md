@@ -11,7 +11,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Changed
-- _TBD_
+- **长期记忆全面重构**：从「embedding 余弦检索」改为「四层金字塔 + BM25 + LLM 主导」：
+  L0 消息 → L1 原子记忆（`persona`/`episodic`/`instruction`）→ L2 主题场景（上限 15）→ L3 用户画像（≤2000 字）。
+  全程零 embedding，新增 SQLite FTS5（bigram 中文分词）做关键词召回，LLM 负责抽取 / 冲突仲裁 / 场景归类 / 画像生成。
+- **新增内置 agent 工具**：`oto_memory_search` / `oto_scene_read` / `oto_conversation_search`，与 MCP 工具并列暴露给 LLM。
+- **system prompt 改为缓存友好布局**：persona 设定 + L3 画像 + L2 场景索引 + 工具说明放头部稳定段，
+  rolling summary + L1 召回 + 最近对话放动态段，提升 OpenAI 兼容协议的 prompt-prefix cache 命中率。
+- **memory 抽取异步化**：新增 `memory.Pipeline` 调度器（warmup 1→2→4→8→16 / threshold / idle / cold-start），
+  消息处理 goroutine 立刻返回，不再阻塞回复延迟。
+
+### Removed (Breaking, 仅影响 0.1.0 之前的 dev 库)
+- `llm_configs.embedding_model` 列。
+- `memories.embedding` 列。
+- `/api/llm/*` 接口中的 `embedding_model` 字段；前端 LLM 配置页移除对应输入框。
+
+### Added
+- 新表：`memory_scenes`、`user_profiles`、`memory_pipeline_states`、`memory_extract_checkpoints`。
+- 新接口：`/api/scene/{list,get,delete}`、`/api/profile/{get,regenerate}`。
+- 前端 PersonaDetailView 新增「用户画像」「主题场景」「原子记忆 + kind 筛选」三个区块。
+- **构建要求**：必须以 `-tags sqlite_fts5` 编译（Makefile/Dockerfile 已加，CI/release workflow 待补）。
+- `store.Open` 启动时自动 backfill FTS 索引（最多 5000 条 memory + 20000 条 message），保证从旧版本升级上来不会出现空索引。
+- proactive 消息现在也注入 L3 用户画像 + L2 场景索引，主动问候不再是泛泛而谈；outbound 文本同步写入 `messages_fts` 供后续 `oto_conversation_search` 检索。
+
+### Fixed
+- **多会话 persona 的 pipeline checkpoint 互相干扰**：`last_extracted_message_id` 原本是 per-persona，导致一个高频好友会把另一个安静好友的「未处理消息计数」算错。改为按 (persona, conversation) 拆表（`memory_extract_checkpoints`）。
+- **persona 删除 / admin 删除用户 / conversation 删除**：补全对 `memory_scenes` / `user_profiles` / `memory_pipeline_states` / `memory_extract_checkpoints` / `memories_fts` / `messages_fts` 的级联清理，杜绝孤儿数据。
+- **场景上限失守**：当 L2 场景已达 15 个上限、LLM 仍输出 `create` 时，事务内 `COUNT(*)` 校验会直接拒绝该决策，避免索引被稀释；该 atom 保留 orphan 由下一轮 pipeline 重试归类。
+- **未归类 atom 永远是孤儿**：`runOneCycle` 现每次额外扫至多 16 个 `scene_id=''` 的 atom 重做 scene-fit。
+- **dangling watermark 卡死计数**：`countPendingMessages` 在 `last_extracted_message_id` 行被删时通过 `COALESCE(..., '1970-01-01')` 退化为「无 watermark」，不再把 pending 永远算成 0。
 
 ---
 

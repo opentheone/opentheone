@@ -207,11 +207,49 @@ func (h *AdminHandler) DeleteUser(c *gin.Context) {
 		}
 	}
 	if len(personaIDs) > 0 {
+		// FTS5 virtual table — GORM cascade rules don't reach it, must be
+		// purged with an explicit DELETE before / alongside the canonical
+		// memories rows. Same goes for messages_fts further down (scoped to
+		// the deleted conversations).
+		if err := tx.Exec(`DELETE FROM memories_fts WHERE persona_id IN ?`, personaIDs).Error; err != nil {
+			fail(c, http.StatusInternalServerError, 500, err.Error())
+			return
+		}
 		if err := tx.Where("persona_id IN ?", personaIDs).Delete(&model.Memory{}).Error; err != nil {
 			fail(c, http.StatusInternalServerError, 500, err.Error())
 			return
 		}
+		// L2 scenes, L3 profile, per-persona pipeline state, per-(persona,
+		// conv) checkpoint — all persona-scoped, all need to die with the
+		// user's personas. Otherwise the next user (or a re-created persona
+		// with the same id, however unlikely) would inherit zombie memory
+		// state.
+		if err := tx.Where("persona_id IN ?", personaIDs).Delete(&model.MemoryScene{}).Error; err != nil {
+			fail(c, http.StatusInternalServerError, 500, err.Error())
+			return
+		}
+		if err := tx.Where("persona_id IN ?", personaIDs).Delete(&model.UserProfile{}).Error; err != nil {
+			fail(c, http.StatusInternalServerError, 500, err.Error())
+			return
+		}
+		if err := tx.Where("persona_id IN ?", personaIDs).Delete(&model.MemoryPipelineState{}).Error; err != nil {
+			fail(c, http.StatusInternalServerError, 500, err.Error())
+			return
+		}
+		if err := tx.Where("persona_id IN ?", personaIDs).Delete(&model.MemoryExtractCheckpoint{}).Error; err != nil {
+			fail(c, http.StatusInternalServerError, 500, err.Error())
+			return
+		}
 		if err := tx.Where("id IN ?", personaIDs).Delete(&model.Persona{}).Error; err != nil {
+			fail(c, http.StatusInternalServerError, 500, err.Error())
+			return
+		}
+	}
+	// messages_fts is keyed by conversation_id; purge here (after the message
+	// rows are gone above) so the `oto_conversation_search` tool can't return
+	// stale hits pointing at non-existent messages.
+	if len(convIDs) > 0 {
+		if err := tx.Exec(`DELETE FROM messages_fts WHERE conversation_id IN ?`, convIDs).Error; err != nil {
 			fail(c, http.StatusInternalServerError, 500, err.Error())
 			return
 		}

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { api } from "@/api";
 import { useRouter } from "vue-router";
 
@@ -48,10 +48,29 @@ interface MCPToolsResult {
 
 interface Memory {
   id: string;
-  kind: string;
+  kind: string; // persona | episodic | instruction (+ legacy: fact / preference / event / summary)
   content: string;
   importance: number;
+  scene_id: string;
   created_at: string;
+}
+
+interface MemoryScene {
+  id: string;
+  title: string;
+  summary: string;
+  atom_count: number;
+  heat: number;
+  updated_at: string;
+}
+
+interface UserProfile {
+  id: string;
+  content: string;
+  scene_count_at_gen: number;
+  atoms_at_gen: number;
+  generated_at: string;
+  request_reason: string;
 }
 
 interface BindingStatus {
@@ -83,6 +102,15 @@ const mcpExpanded = ref<Record<string, boolean>>({});
 const mcpToolsLoading = ref<Record<string, boolean>>({});
 const mcpToolsCache = ref<Record<string, MCPToolsResult>>({});
 const memories = ref<Memory[]>([]);
+const memoryKindFilter = ref<string>("all");
+const scenes = ref<MemoryScene[]>([]);
+const maxScenes = ref<number>(15);
+const expandedSceneID = ref<string | null>(null);
+const expandedSceneAtoms = ref<Memory[]>([]);
+const expandedSceneLoading = ref(false);
+const profile = ref<UserProfile | null>(null);
+const profileBusy = ref(false);
+const profileResult = ref<{ ok: boolean; msg: string } | null>(null);
 const err = ref("");
 const saving = ref(false);
 
@@ -157,6 +185,104 @@ async function loadLLM() {
 async function loadMemories() {
   const r = await api<{ items: Memory[] }>("/api/memory/list", { persona_id: props.id, limit: 100 });
   memories.value = r.items || [];
+}
+
+const kindLabels: Record<string, string> = {
+  persona: "稳定属性",
+  episodic: "事件",
+  instruction: "对 AI 指令",
+  // legacy kinds — still shown if they predate the new taxonomy:
+  fact: "事实(旧)",
+  preference: "偏好(旧)",
+  event: "事件(旧)",
+  summary: "摘要(旧)",
+};
+
+const filteredMemories = computed(() => {
+  if (memoryKindFilter.value === "all") return memories.value;
+  return memories.value.filter((m) => normaliseKind(m.kind) === memoryKindFilter.value);
+});
+
+function normaliseKind(k: string): string {
+  switch (k) {
+    case "preference":
+    case "fact":
+    case "summary":
+      return "persona";
+    case "event":
+      return "episodic";
+    case "rule":
+      return "instruction";
+    default:
+      return k || "persona";
+  }
+}
+
+async function loadScenes() {
+  try {
+    const r = await api<{ items: MemoryScene[]; max_scenes: number }>("/api/scene/list", { persona_id: props.id });
+    scenes.value = r.items || [];
+    if (r.max_scenes) maxScenes.value = r.max_scenes;
+  } catch {
+    scenes.value = [];
+  }
+}
+
+async function toggleScene(s: MemoryScene) {
+  if (expandedSceneID.value === s.id) {
+    expandedSceneID.value = null;
+    expandedSceneAtoms.value = [];
+    return;
+  }
+  expandedSceneID.value = s.id;
+  expandedSceneLoading.value = true;
+  try {
+    const r = await api<{ scene: MemoryScene; atoms: Memory[] }>("/api/scene/get", {
+      persona_id: props.id,
+      scene_id: s.id,
+    });
+    expandedSceneAtoms.value = r.atoms || [];
+  } catch {
+    expandedSceneAtoms.value = [];
+  } finally {
+    expandedSceneLoading.value = false;
+  }
+}
+
+async function deleteScene(s: MemoryScene) {
+  if (!confirm(`删除场景「${s.title}」？（其中归属的记忆会保留，但会被重新归类。）`)) return;
+  await api("/api/scene/delete", { persona_id: props.id, scene_id: s.id });
+  if (expandedSceneID.value === s.id) {
+    expandedSceneID.value = null;
+    expandedSceneAtoms.value = [];
+  }
+  await loadScenes();
+}
+
+async function loadProfile() {
+  try {
+    const r = await api<{ profile: UserProfile | null }>("/api/profile/get", { persona_id: props.id });
+    profile.value = r.profile;
+  } catch {
+    profile.value = null;
+  }
+}
+
+async function regenerateProfile() {
+  profileBusy.value = true;
+  profileResult.value = null;
+  try {
+    const r = await api<{ profile: UserProfile }>("/api/profile/regenerate", {
+      persona_id: props.id,
+      reason: "manual",
+    });
+    profile.value = r.profile;
+    profileResult.value = { ok: true, msg: `已重新生成，基于 ${r.profile.atoms_at_gen} 条记忆 / ${r.profile.scene_count_at_gen} 个场景。` };
+  } catch (e: any) {
+    profileResult.value = { ok: false, msg: e?.message || String(e) };
+  } finally {
+    profileBusy.value = false;
+  }
 }
 
 async function save() {
@@ -300,16 +426,16 @@ async function forgetMemory(m: Memory) {
   await loadMemories();
 }
 
-const newMemory = ref({ content: "", importance: 5, kind: "fact" });
+const newMemory = ref({ content: "", importance: 5, kind: "persona" });
 async function addMemory() {
   if (!newMemory.value.content.trim()) return;
   await api("/api/memory/upsert_manual", { persona_id: props.id, ...newMemory.value });
-  newMemory.value = { content: "", importance: 5, kind: "fact" };
+  newMemory.value = { content: "", importance: 5, kind: "persona" };
   await loadMemories();
 }
 
 watch(() => props.id, async () => {
-  await Promise.all([loadPersona(), loadMemories(), loadExistingBinding()]);
+  await Promise.all([loadPersona(), loadMemories(), loadScenes(), loadProfile(), loadExistingBinding()]);
 });
 
 onMounted(async () => {
@@ -319,6 +445,8 @@ onMounted(async () => {
       loadLLM(),
       loadMCP(),
       loadMemories(),
+      loadScenes(),
+      loadProfile(),
       loadExistingBinding(),
     ]);
   } catch (e: any) {
@@ -564,19 +692,90 @@ function back() {
         </div>
 
         <div class="card p-6">
-          <h2 class="text-lg font-medium mb-2">长期记忆</h2>
+          <div class="flex items-baseline justify-between mb-2">
+            <h2 class="text-lg font-medium">用户画像 (L3)</h2>
+            <button
+              class="btn-ghost text-xs"
+              :disabled="profileBusy"
+              @click="regenerateProfile"
+            >{{ profileBusy ? "生成中…" : "重新生成" }}</button>
+          </div>
+          <p class="text-xs text-ink-400 mb-3">
+            由 LLM 把所有长期记忆 + 主题场景汇总成的简洁画像，会自动注入到每次对话的系统提示头部。
+          </p>
+          <div
+            v-if="profileResult"
+            class="text-[11px] mb-2"
+            :class="profileResult.ok ? 'text-emerald-400' : 'text-rose-400'"
+          >{{ profileResult.msg }}</div>
+          <div v-if="!profile" class="text-xs text-ink-400 py-4 text-center">
+            尚未生成。多聊几轮后 TA 会自动生成；也可以现在手动「重新生成」。
+          </div>
+          <div v-else>
+            <div class="text-[11px] text-ink-500 mb-2">
+              最近生成：{{ profile.generated_at }} · {{ profile.atoms_at_gen }} 条记忆 / {{ profile.scene_count_at_gen }} 个场景 · 触发：{{ profile.request_reason }}
+            </div>
+            <pre class="text-xs whitespace-pre-wrap font-sans bg-ink-950 border border-ink-800 rounded-lg p-3 max-h-72 overflow-y-auto">{{ profile.content }}</pre>
+          </div>
+        </div>
+
+        <div class="card p-6">
+          <div class="flex items-baseline justify-between mb-2">
+            <h2 class="text-lg font-medium">主题场景 (L2)</h2>
+            <span class="text-xs text-ink-500">{{ scenes.length }} / {{ maxScenes }}</span>
+          </div>
+          <p class="text-xs text-ink-400 mb-3">
+            LLM 把相关的原子记忆归到主题场景里。每个场景的标题/摘要会自动注入系统提示，作为「记忆目录」让 TA 知道什么时候应该深读。
+          </p>
+          <div v-if="scenes.length === 0" class="text-xs text-ink-400 py-4 text-center">
+            尚无场景。
+          </div>
+          <ul v-else class="divide-y divide-ink-800">
+            <li v-for="s in scenes" :key="s.id" class="py-2">
+              <div class="flex items-start gap-2">
+                <div class="flex-1 min-w-0">
+                  <div class="text-sm font-medium">{{ s.title }}</div>
+                  <div class="text-[11px] text-ink-400 mt-0.5">{{ s.summary || "（待生成摘要）" }}</div>
+                  <div class="text-[10px] text-ink-500 mt-1">
+                    {{ s.atom_count }} 条 · heat {{ s.heat }} · {{ s.updated_at }}
+                  </div>
+                </div>
+                <div class="flex flex-col gap-1 items-end">
+                  <button class="text-ink-400 hover:text-ink-100 text-xs" @click="toggleScene(s)">
+                    {{ expandedSceneID === s.id ? "收起" : "查看" }}
+                  </button>
+                  <button class="text-ink-500 hover:text-rose-400 text-xs" @click="deleteScene(s)">删除</button>
+                </div>
+              </div>
+              <div v-if="expandedSceneID === s.id" class="mt-2 pl-2 border-l-2 border-ink-800">
+                <div v-if="expandedSceneLoading" class="text-[11px] text-ink-500">加载中…</div>
+                <ul v-else-if="expandedSceneAtoms.length === 0" class="text-[11px] text-ink-500">
+                  （场景内尚无活跃原子）
+                </ul>
+                <ul v-else class="space-y-1">
+                  <li v-for="a in expandedSceneAtoms" :key="a.id" class="text-[11px]">
+                    <span class="text-ink-500">[{{ kindLabels[a.kind] || a.kind }} · imp {{ a.importance }}]</span>
+                    {{ a.content }}
+                  </li>
+                </ul>
+              </div>
+            </li>
+          </ul>
+        </div>
+
+        <div class="card p-6">
+          <h2 class="text-lg font-medium mb-2">原子记忆 (L1)</h2>
           <p class="text-xs text-ink-400 mb-4">
-            对话过程中，TA 会自动记住关于你的偏好、事实、计划。你也可以手动写入或删除。
+            对话过程中，TA 会自动归纳值得长期记住的事实。你也可以手动写入或删除。
           </p>
 
           <div class="space-y-2 mb-4">
             <textarea v-model="newMemory.content" rows="2" class="textarea" placeholder="想让 TA 永远记住的一句话…" />
             <div class="flex items-center gap-2 text-xs">
               <select v-model="newMemory.kind" class="input w-32 text-xs py-1">
-                <option value="fact">事实</option>
-                <option value="preference">偏好</option>
-                <option value="event">事件</option>
-                <option value="summary">总结</option>
+                <option value="persona">稳定属性</option>
+                <option value="episodic">事件</option>
+                <option value="instruction">对 AI 指令</option>
               </select>
               <label class="text-ink-400">重要性</label>
               <input v-model.number="newMemory.importance" type="number" min="1" max="10" class="input w-16 text-xs py-1" />
@@ -584,15 +783,31 @@ function back() {
             </div>
           </div>
 
-          <div v-if="memories.length === 0" class="text-xs text-ink-400 py-4 text-center">
+          <div class="flex items-center gap-2 text-xs mb-2">
+            <span class="text-ink-400">筛选：</span>
+            <button
+              v-for="k in ['all', 'persona', 'episodic', 'instruction']"
+              :key="k"
+              class="px-2 py-0.5 rounded border"
+              :class="memoryKindFilter === k
+                ? 'bg-accent-600 border-accent-600 text-white'
+                : 'border-ink-700 text-ink-300 hover:border-ink-500'"
+              @click="memoryKindFilter = k"
+            >{{ k === 'all' ? '全部' : kindLabels[k] }}</button>
+          </div>
+
+          <div v-if="filteredMemories.length === 0" class="text-xs text-ink-400 py-4 text-center">
             尚无记忆。开始聊天后 TA 会自动归纳重要内容到这里。
           </div>
           <ul v-else class="divide-y divide-ink-800 max-h-96 overflow-y-auto">
-            <li v-for="m in memories" :key="m.id" class="py-2 flex items-start gap-2">
-              <span class="badge text-[10px] mt-0.5">{{ m.kind }}</span>
+            <li v-for="m in filteredMemories" :key="m.id" class="py-2 flex items-start gap-2">
+              <span class="badge text-[10px] mt-0.5">{{ kindLabels[m.kind] || m.kind }}</span>
               <div class="flex-1 text-sm">
                 <div>{{ m.content }}</div>
-                <div class="text-[10px] text-ink-500 mt-1">重要性 {{ m.importance }} · {{ m.created_at }}</div>
+                <div class="text-[10px] text-ink-500 mt-1">
+                  重要性 {{ m.importance }} · {{ m.created_at }}
+                  <span v-if="m.scene_id"> · scene</span>
+                </div>
               </div>
               <button class="text-ink-500 hover:text-rose-400 text-xs" @click="forgetMemory(m)">删除</button>
             </li>

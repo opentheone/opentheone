@@ -39,6 +39,9 @@ type Engine struct {
 	// before falling back to whatever text the LLM produced. Guards against
 	// runaway loops where the model keeps re-calling the same tool.
 	agentMaxSteps int
+	// pipeline runs async L1→L2→L3 memory processing after each reply.
+	// Optional — when nil the engine falls back to legacy inline extraction.
+	pipeline *memory.Pipeline
 }
 
 type Options struct {
@@ -86,6 +89,40 @@ func NewEngine(db *gorm.DB, ilinkClient *ilink.Client, mem *memory.Service, mcpM
 		attachmentsDir: opts.AttachmentsDir,
 		agentMaxSteps:  opts.AgentMaxSteps,
 	}
+}
+
+// AttachPipeline wires the async memory pipeline. Called once during boot
+// (main.go) after both the engine and the pipeline exist. Memory triggers
+// are no-ops until this is called, so handlers that only need synchronous
+// memory features (manual ingest, scene/profile HTTP) still work without
+// the pipeline running.
+func (e *Engine) AttachPipeline(p *memory.Pipeline) {
+	e.pipeline = p
+}
+
+// ResolveClientForPersona is the engine's persona → LLM client lookup,
+// exported so the memory pipeline can reuse it (it needs the same fallback
+// rules: persona pin → user default).
+func (e *Engine) ResolveClientForPersona(ctx context.Context, personaID string) (*llm.Client, error) {
+	var p model.Persona
+	if err := e.db.WithContext(ctx).Where("id = ?", personaID).First(&p).Error; err != nil {
+		return nil, err
+	}
+	var cfg model.LLMConfig
+	if p.LLMConfigID != "" {
+		_ = e.db.WithContext(ctx).Where("id = ?", p.LLMConfigID).First(&cfg).Error
+	}
+	if cfg.ID == "" {
+		_ = e.db.WithContext(ctx).Where("user_id = ? AND is_default = ?", p.UserID, true).First(&cfg).Error
+	}
+	if cfg.ID == "" {
+		return nil, nil
+	}
+	key, err := crypto.Decrypt(e.secret, cfg.APIKeyEnc)
+	if err != nil || key == "" {
+		return nil, nil
+	}
+	return llm.NewClient(&cfg, key), nil
 }
 
 // upsertConversation finds-or-creates a conversation row and refreshes last_message_at.
@@ -328,24 +365,31 @@ func (e *Engine) HandleInbound(ctx context.Context, binding *model.WeChatBinding
 			stopTyping()
 			return err
 		}
+		// Backfill the conversation FTS index immediately so the
+		// `oto_conversation_search` built-in tool can find this chunk on
+		// the next turn.
+		if e.mem != nil {
+			_ = e.mem.BM25().IndexMessage(ctx, out.ID, conv.ID, chunk)
+		}
 		if i+1 < len(chunks) {
 			time.Sleep(400 * time.Millisecond)
 		}
 	}
 	stopTyping()
 
-	go func(snippet string) {
-		defer func() {
-			if rec := recover(); rec != nil {
-				e.log.Error("ingestMemory goroutine panicked",
-					zap.Any("panic", rec),
-					zap.String("conversation_id", conv.ID))
-			}
-		}()
-		bg, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		e.ingestMemory(bg, persona.ID, conv.ID, inboundMsg.ID, llmClient, snippet)
-	}(buildSnippet(text, reply))
+	// Index the inbound message into the conversation FTS so
+	// `oto_conversation_search` can already find it on the next turn.
+	if e.mem != nil {
+		_ = e.mem.BM25().IndexMessage(ctx, inboundMsg.ID, conv.ID, text)
+	}
+	// Hand the new message pair off to the async memory pipeline. The
+	// pipeline decides — based on per-persona warmup / threshold / idle
+	// timing — whether to actually run the L1→L2→L3 LLM cycle now or wait.
+	// Pipeline failures must never affect message delivery (it runs in
+	// its own goroutine and only logs errors).
+	if e.pipeline != nil {
+		e.pipeline.Trigger(persona.ID, conv.ID)
+	}
 
 	// Fire-and-forget rolling summary. If the conversation has accumulated more
 	// than (historyN + summaryEvery) new messages, fold the old portion in.
@@ -384,11 +428,33 @@ func (e *Engine) generateReply(ctx context.Context, persona *model.Persona, conv
 		Count(&prior).Error
 	firstInteraction := prior == 0
 
-	msgs := []llm.ChatMessage{
-		{Role: "system", Content: buildSystemPrompt(persona, firstInteraction)},
+	// ----- HEADER (cache-friendly, stable) ----------------------------
+	//
+	// Everything above the rolling summary stays byte-stable across turns
+	// inside the same persona + same L3 profile generation, which lets
+	// OpenAI-style prompt-caching kick in. Keep prompt-prefix changes to a
+	// minimum.
+	//
+	// Order:
+	//   1. Persona system prompt
+	//   2. L3 user profile (if any)
+	//   3. L2 scene index (if any)
+	header := buildSystemPrompt(persona, firstInteraction)
+	if e.mem != nil {
+		if profile, err := e.mem.ProfileForPrompt(ctx, persona.ID); err == nil && profile != "" {
+			header += "\n" + profile
+		}
+		if index, err := e.mem.SceneIndexForPrompt(ctx, persona.ID, memory.MaxScenesPerPersona); err == nil && index != "" {
+			header += "\n" + index
+		}
 	}
+	msgs := []llm.ChatMessage{{Role: "system", Content: header}}
 
-	// 1) Rolling summary of older turns (older than summary_updated_at).
+	// ----- DYNAMIC SECTIONS (post-header) -----------------------------
+	//
+	// These vary per turn, so they intentionally live BELOW the header to
+	// preserve the cached prefix above.
+
 	if strings.TrimSpace(conv.Summary) != "" {
 		msgs = append(msgs, llm.ChatMessage{
 			Role:    "system",
@@ -396,12 +462,11 @@ func (e *Engine) generateReply(ctx context.Context, persona *model.Persona, conv
 		})
 	}
 
-	// 2) Long-term memory bullets, scoped to this persona + boosted by this conversation.
 	if e.mem != nil {
 		mems, err := e.mem.RetrieveForConversation(ctx, llmClient, persona.ID, conv.ID, userText, e.retrieveK)
 		if err == nil && len(mems) > 0 {
 			var b strings.Builder
-			b.WriteString("【你需要记住的关于对方的长期信息（不要直接照念，自然融入回复）】\n")
+			b.WriteString("【与当前消息最相关的长期记忆（按相关度排序，不要直接照念，自然融入回复）】\n")
 			for _, m := range mems {
 				b.WriteString("- ")
 				b.WriteString(m.Content)
@@ -411,7 +476,7 @@ func (e *Engine) generateReply(ctx context.Context, persona *model.Persona, conv
 		}
 	}
 
-	// 3) Recent verbatim history — only real inbound/outbound messages newer
+	// Recent verbatim history — only real inbound/outbound messages newer
 	// than the summary watermark. We deliberately exclude the agent-loop
 	// audit rows (tool_call / tool_result) here: they're persisted for the
 	// user's debugging, not for re-feeding into a fresh LLM turn (the live
@@ -438,26 +503,30 @@ func (e *Engine) generateReply(ctx context.Context, persona *model.Persona, conv
 		}
 	}
 
-	// 4) Load MCP tools for this persona (may be empty).
+	// ----- TOOLS -------------------------------------------------------
+	//
+	// Built-in (memory_search / scene_read / conversation_search) are
+	// ALWAYS available; MCP tools are appended on top when the persona has
+	// any enabled.
 	var registry *mcp.Registry
 	if e.mcp != nil {
 		registry = mcp.LoadForPersona(ctx, e.db, e.mcp, e.log, persona)
 	}
-	// Fast path: no tools available → original non-streaming chat completion.
-	if registry == nil || registry.Empty() {
-		return llmClient.Chat(ctx, msgs)
+
+	tools := append([]mcp.LLMTool(nil), builtinTools...)
+	if registry != nil {
+		tools = append(tools, registry.Tools()...)
 	}
 
-	// Tools available: append a brief usage hint, then run the agent loop.
-	tools := registry.Tools()
-	msgs = append([]llm.ChatMessage{msgs[0], {
-		Role: "system",
-		Content: "你可以调用下面这些工具来帮助回答（仅在你认为有用时才调用）。" +
-			"每次工具返回后，请用自然口语化的方式融合到回复里，不要把工具结果原样贴出。" +
-			"工具调用是后台行为，对方看不到。",
-	}}, msgs[1:]...)
+	// Tool usage hint inserted as the second system message so it doesn't
+	// disrupt the cached header prefix.
+	hint := builtinToolUsageHint
+	if registry != nil && !registry.Empty() {
+		hint += "\n\n此外你还接入了若干 MCP 工具，名字以 mcp__ 开头，按需调用即可。"
+	}
+	msgs = append([]llm.ChatMessage{msgs[0], {Role: "system", Content: hint}}, msgs[1:]...)
 
-	return e.runAgentLoop(ctx, conv, llmClient, registry, tools, msgs)
+	return e.runAgentLoop(ctx, persona, conv, llmClient, registry, tools, msgs)
 }
 
 // runAgentLoop drives the assistant → tool_calls → tool_results loop until
@@ -475,6 +544,7 @@ func (e *Engine) generateReply(ctx context.Context, persona *model.Persona, conv
 //     fallback so the user isn't ghosted.
 func (e *Engine) runAgentLoop(
 	ctx context.Context,
+	persona *model.Persona,
 	conv *model.Conversation,
 	llmClient *llm.Client,
 	registry *mcp.Registry,
@@ -542,7 +612,18 @@ func (e *Engine) runAgentLoop(
 					continue
 				}
 			}
-			result, isErr, err := registry.Invoke(ctx, call.Name, args)
+			var (
+				result string
+				isErr  bool
+				err    error
+			)
+			if isBuiltinTool(call.Name) {
+				result, isErr, err = e.invokeBuiltinTool(ctx, call.Name, args, persona.ID, conv.ID)
+			} else if registry != nil {
+				result, isErr, err = registry.Invoke(ctx, call.Name, args)
+			} else {
+				err = fmt.Errorf("tool %q not available (no MCP registry loaded)", call.Name)
+			}
 			content := result
 			status := "ok"
 			switch {
@@ -735,31 +816,10 @@ func findSplit(s string, maxChars int) int {
 	return cutByte
 }
 
-func buildSnippet(userText, assistantText string) string {
-	var b strings.Builder
-	b.WriteString("USER: ")
-	b.WriteString(userText)
-	b.WriteString("\nASSISTANT: ")
-	b.WriteString(assistantText)
-	return b.String()
-}
-
-func (e *Engine) ingestMemory(ctx context.Context, personaID, convID, sourceMsgID string, llmClient *llm.Client, snippet string) {
-	if e.mem == nil {
-		return
-	}
-	facts, err := e.mem.ExtractFacts(ctx, llmClient, snippet)
-	if err != nil {
-		e.log.Debug("extract facts failed", zap.Error(err))
-		return
-	}
-	for _, f := range facts {
-		if strings.TrimSpace(f.Content) == "" {
-			continue
-		}
-		_ = e.mem.Ingest(ctx, llmClient, personaID, convID, sourceMsgID, f.Kind, f.Content, f.Importance)
-	}
-}
+// The legacy synchronous ingestMemory()/buildSnippet() helpers were removed
+// in the M5 pipeline migration. New memory extraction is driven by
+// engine.pipeline (set via AttachPipeline) and runs entirely on the
+// pipeline's own goroutines + per-persona scheduling state.
 
 // SendLiteralText sends an exact piece of text from the bot to the given peer, bypassing the LLM.
 // It is used for the "manual override" send_manual endpoint and for posting persona greetings.
@@ -861,8 +921,21 @@ func (e *Engine) SendProactive(ctx context.Context, binding *model.WeChatBinding
 	if strings.TrimSpace(prompt) == "" {
 		prompt = "请用你的口吻，主动给对方发一句关心问候，简短自然。"
 	}
+	// Build the same cache-friendly system header generateReply uses, so
+	// proactive greetings benefit from the L3 user portrait + L2 scene
+	// index. Without this the AI would send generic "你好" greetings
+	// instead of e.g. referencing what the user mentioned yesterday.
+	sysHeader := buildSystemPrompt(persona, false)
+	if e.mem != nil {
+		if profile, perr := e.mem.ProfileForPrompt(ctx, persona.ID); perr == nil && profile != "" {
+			sysHeader += "\n\n" + profile
+		}
+		if sceneIdx, serr := e.mem.SceneIndexForPrompt(ctx, persona.ID, 0); serr == nil && sceneIdx != "" {
+			sysHeader += "\n\n" + sceneIdx
+		}
+	}
 	msgs := []llm.ChatMessage{
-		{Role: "system", Content: buildSystemPrompt(persona, false)},
+		{Role: "system", Content: sysHeader},
 		{Role: "user", Content: prompt},
 	}
 	reply, err := llmClient.Chat(ctx, msgs)
@@ -896,7 +969,12 @@ func (e *Engine) SendProactive(ctx context.Context, binding *model.WeChatBinding
 			Text:           chunk,
 			Status:         "sent",
 		}
-		_ = e.db.WithContext(ctx).Create(&out).Error
+		if err := e.db.WithContext(ctx).Create(&out).Error; err == nil && e.mem != nil {
+			// Index proactive outbound so `oto_conversation_search` can
+			// find what the AI said unprompted. Errors here are non-fatal;
+			// the message is already persisted in the canonical table.
+			_ = e.mem.BM25().IndexMessage(ctx, out.ID, conv.ID, chunk)
+		}
 	}
 	now := time.Now()
 	_ = e.db.WithContext(ctx).Model(&model.WeChatBinding{}).

@@ -115,6 +115,12 @@ func main() {
 		RetrieveK:      5,
 		AttachmentsDir: cfg.Storage.AttachmentsDir,
 	})
+	// Wire the async memory pipeline. The engine's per-persona client
+	// resolver (same fallback rules as the chat path) is injected here so
+	// pipeline jobs use the right LLM config and decrypted API key.
+	memPipeline := memory.NewPipeline(memSvc, log)
+	memPipeline.SetClientResolver(eng.ResolveClientForPersona)
+	eng.AttachPipeline(memPipeline)
 
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	defer rootCancel()

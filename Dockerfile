@@ -40,6 +40,7 @@ WORKDIR /src/backend
 RUN CGO_ENABLED=1 GOOS=linux \
     go build \
       -trimpath \
+      -tags=sqlite_fts5 \
       -ldflags="-s -w \
         -X main.Version=${VERSION} \
         -X main.Commit=${COMMIT} \

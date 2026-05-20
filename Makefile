@@ -28,20 +28,25 @@ build: all ## Alias for `all`
 build-frontend: ## pnpm install + pnpm build (writes into backend/internal/web/dist)
 	cd $(FRONTEND_DIR) && pnpm install && pnpm build
 
+# Build tag `sqlite_fts5` switches on FTS5 in mattn/go-sqlite3 — the long-term
+# memory layer (L1 BM25 over `memories_fts`) requires it. Without the tag the
+# server will boot but `EnsureSchema` returns `no such module: fts5`.
+GO_TAGS := sqlite_fts5
+
 build-backend: ## go build the server binary with version info
-	cd $(BACKEND_DIR) && go build -trimpath -ldflags="$(LDFLAGS)" -o oto-server ./cmd/server
+	cd $(BACKEND_DIR) && go build -trimpath -tags='$(GO_TAGS)' -ldflags="$(LDFLAGS)" -o oto-server ./cmd/server
 
 run: build-backend ## Run the server (no frontend rebuild)
 	$(BIN) --config $(BACKEND_DIR)/config.yaml
 
 dev: ## Run backend with `go run` (no embed) — for use alongside `pnpm dev`
-	cd $(BACKEND_DIR) && go run ./cmd/server
+	cd $(BACKEND_DIR) && go run -tags='$(GO_TAGS)' ./cmd/server
 
 test: ## go test ./... (race detector on)
-	cd $(BACKEND_DIR) && go test -race -count=1 ./...
+	cd $(BACKEND_DIR) && go test -race -count=1 -tags='$(GO_TAGS)' ./...
 
 vet: ## go vet ./...
-	cd $(BACKEND_DIR) && go vet ./...
+	cd $(BACKEND_DIR) && go vet -tags='$(GO_TAGS)' ./...
 
 lint: ## golangci-lint run ./... (install first: https://golangci-lint.run)
 	cd $(BACKEND_DIR) && golangci-lint run ./...

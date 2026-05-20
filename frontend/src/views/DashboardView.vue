@@ -30,7 +30,6 @@ interface LLMConfigItem {
   name: string;
   base_url: string;
   chat_model: string;
-  embedding_model: string;
   is_default: boolean;
   api_key_set: boolean;
 }

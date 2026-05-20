@@ -7,20 +7,17 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
-	"github.com/opentheone/opentheone/backend/internal/crypto"
-	"github.com/opentheone/opentheone/backend/internal/llm"
 	"github.com/opentheone/opentheone/backend/internal/memory"
 	"github.com/opentheone/opentheone/backend/internal/model"
 )
 
 type MemoryHandler struct {
-	db     *gorm.DB
-	mem    *memory.Service
-	secret string
+	db  *gorm.DB
+	mem *memory.Service
 }
 
-func NewMemoryHandler(db *gorm.DB, mem *memory.Service, secret string) *MemoryHandler {
-	return &MemoryHandler{db: db, mem: mem, secret: secret}
+func NewMemoryHandler(db *gorm.DB, mem *memory.Service) *MemoryHandler {
+	return &MemoryHandler{db: db, mem: mem}
 }
 
 type memListReq struct {
@@ -74,6 +71,9 @@ func (h *MemoryHandler) Delete(c *gin.Context) {
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}
+	// Drop the BM25 row too — otherwise retrieval still returns this
+	// memory's content even though the underlying row is gone.
+	_ = h.mem.BM25().DeleteMemory(c.Request.Context(), req.ID)
 	ok(c, gin.H{"id": req.ID})
 }
 
@@ -96,35 +96,21 @@ func (h *MemoryHandler) UpsertManual(c *gin.Context) {
 		fail(c, http.StatusBadRequest, 400, "content required")
 		return
 	}
+	// Default to `persona` (stable user attribute) — the most common manual
+	// add ("user prefers Cantonese") and consistent with what the L1
+	// extractor emits.
 	if req.Kind == "" {
-		req.Kind = "fact"
+		req.Kind = "persona"
 	}
 	var p model.Persona
 	if err := h.db.Where("id = ? AND user_id = ?", req.PersonaID, uid).First(&p).Error; err != nil {
 		fail(c, http.StatusNotFound, 404, "persona not found")
 		return
 	}
-	// Resolve the LLM client used to embed the new memory. Order:
-	//   1. The persona's explicitly configured llm_config_id
-	//   2. The user's is_default = true config
-	// Without the fallback, any persona that hadn't been pinned to a specific
-	// model would silently bypass embedding — and the manual memory would
-	// then be invisible to vector-similarity retrieval (only reachable via
-	// the importance/recency pre-filter), defeating the point of adding it.
-	var llmClient *llm.Client
-	var cfg model.LLMConfig
-	if p.LLMConfigID != "" {
-		_ = h.db.Where("id = ?", p.LLMConfigID).First(&cfg).Error
-	}
-	if cfg.ID == "" {
-		_ = h.db.Where("user_id = ? AND is_default = ?", uid, true).First(&cfg).Error
-	}
-	if cfg.ID != "" {
-		if key, err := crypto.Decrypt(h.secret, cfg.APIKeyEnc); err == nil && key != "" {
-			llmClient = llm.NewClient(&cfg, key)
-		}
-	}
-	if err := h.mem.Ingest(c.Request.Context(), llmClient, req.PersonaID, "", "", req.Kind, req.Content, req.Importance); err != nil {
+	// Manual upsert path is the simplest: BM25 dedup against existing atoms,
+	// no LLM round-trip required. The pipeline will pick up new atoms and
+	// fold them into L2 scenes asynchronously.
+	if err := h.mem.IngestManual(c.Request.Context(), req.PersonaID, req.Kind, req.Content, req.Importance); err != nil {
 		fail(c, http.StatusInternalServerError, 500, err.Error())
 		return
 	}

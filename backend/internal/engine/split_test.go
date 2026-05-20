@@ -118,10 +118,3 @@ func TestExtractInboundText_NilSafe(t *testing.T) {
 		t.Errorf("nil msg should return (\"\",\"text\"), got (%q,%q)", got, kind)
 	}
 }
-
-func TestBuildSnippet(t *testing.T) {
-	s := buildSnippet("u", "a")
-	if !strings.Contains(s, "USER: u") || !strings.Contains(s, "ASSISTANT: a") {
-		t.Errorf("snippet missing roles: %q", s)
-	}
-}

@@ -12,7 +12,7 @@ import (
 	"github.com/opentheone/opentheone/backend/internal/model"
 )
 
-// Client wraps go-openai with config and exposes Chat + Embed.
+// Client wraps go-openai with config and exposes Chat.
 type Client struct {
 	api    *openai.Client
 	config *model.LLMConfig
@@ -244,24 +244,6 @@ func toOpenAIMessages(msgs []ChatMessage) []openai.ChatCompletionMessage {
 		out = append(out, om)
 	}
 	return out
-}
-
-// Embed turns one text into a float32 vector using the configured embedding_model.
-func (c *Client) Embed(ctx context.Context, text string) ([]float32, error) {
-	if c.config == nil || c.config.EmbeddingModel == "" {
-		return nil, errors.New("llm: embedding_model not configured")
-	}
-	resp, err := c.api.CreateEmbeddings(ctx, openai.EmbeddingRequest{
-		Model: openai.EmbeddingModel(c.config.EmbeddingModel),
-		Input: []string{text},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("embed: %w", err)
-	}
-	if len(resp.Data) == 0 {
-		return nil, errors.New("llm: empty embedding")
-	}
-	return resp.Data[0].Embedding, nil
 }
 
 // Ping does a quick test request used by /api/llm/test.

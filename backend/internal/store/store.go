@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -12,6 +13,7 @@ import (
 	gormlogger "gorm.io/gorm/logger"
 
 	"github.com/opentheone/opentheone/backend/internal/config"
+	"github.com/opentheone/opentheone/backend/internal/memory"
 	"github.com/opentheone/opentheone/backend/internal/model"
 )
 
@@ -84,6 +86,19 @@ func Open(cfg *config.DatabaseConfig) (*gorm.DB, error) {
 
 	if err := db.AutoMigrate(model.AllModels()...); err != nil {
 		return nil, fmt.Errorf("auto migrate: %w", err)
+	}
+	// FTS5 virtual tables can't be expressed in GORM models — bring them up
+	// (idempotent CREATE IF NOT EXISTS) right after the base schema so the
+	// memory service can immediately start indexing.
+	if err := memory.EnsureSchema(db); err != nil {
+		return nil, fmt.Errorf("fts schema: %w", err)
+	}
+	// Backfill the FTS index for any rows that pre-date this package (e.g.
+	// the legacy embedding-based memory system). Bounded so a huge legacy
+	// install doesn't stall boot — the remainder gets indexed organically
+	// as rows are read/updated through the live memory pipeline.
+	if err := memory.BackfillIndex(context.Background(), db); err != nil {
+		return nil, fmt.Errorf("fts backfill: %w", err)
 	}
 	return db, nil
 }

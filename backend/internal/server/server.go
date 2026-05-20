@@ -115,10 +115,19 @@ func Build(deps Deps) *http.Server {
 			ath := handler.NewAttachmentHandler(deps.DB)
 			authed.POST("/attachment/get", ath.Get)
 
-			mh := handler.NewMemoryHandler(deps.DB, deps.Memory, deps.Config.Auth.JWTSecret)
+			mh := handler.NewMemoryHandler(deps.DB, deps.Memory)
 			authed.POST("/memory/list", mh.List)
 			authed.POST("/memory/delete", mh.Delete)
 			authed.POST("/memory/upsert_manual", mh.UpsertManual)
+
+			sh := handler.NewSceneHandler(deps.DB, deps.Memory)
+			authed.POST("/scene/list", sh.List)
+			authed.POST("/scene/get", sh.Get)
+			authed.POST("/scene/delete", sh.Delete)
+
+			prh := handler.NewProfileHandler(deps.DB, deps.Memory, deps.Config.Auth.JWTSecret)
+			authed.POST("/profile/get", prh.Get)
+			authed.POST("/profile/regenerate", prh.Regenerate)
 
 			mcph := handler.NewMCPHandler(deps.DB, deps.MCP)
 			authed.POST("/mcp/create", mcph.Create)

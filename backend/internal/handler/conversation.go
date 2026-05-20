@@ -314,6 +314,17 @@ func (h *ConversationHandler) Delete(c *gin.Context) {
 		return
 	}
 
+	// Drop FTS index rows for the deleted messages — otherwise the
+	// `oto_conversation_search` built-in tool would keep returning rotted
+	// hits pointing at message_ids that no longer exist.
+	_ = h.db.Exec("DELETE FROM messages_fts WHERE conversation_id = ?", req.ConversationID).Error
+	// Drop the memory-pipeline checkpoint for this conversation too —
+	// otherwise the LastExtractedMessageID watermark would dangle (the
+	// referenced message was just deleted) and pending-message counts for
+	// any FUTURE conversation that happens to reuse this id would skew.
+	_ = h.db.Where("conversation_id = ?", req.ConversationID).
+		Delete(&model.MemoryExtractCheckpoint{}).Error
+
 	for _, p := range attachmentPaths {
 		if p != "" {
 			_ = os.Remove(p)
