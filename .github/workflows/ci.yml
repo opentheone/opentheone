@@ -56,7 +56,7 @@ jobs:
       # The Go build embeds frontend/dist via go:embed; pull it in from the previous job
       # so we exercise the same end-to-end binary that ships in releases.
       - name: Download frontend dist
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           name: frontend-dist
           path: backend/internal/web/dist
