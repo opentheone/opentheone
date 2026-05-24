@@ -46,7 +46,7 @@ jobs:
           pnpm install --frozen-lockfile || pnpm install
           pnpm build
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: frontend-dist
           path: backend/internal/web/dist
@@ -158,7 +158,7 @@ jobs:
             powershell -Command "(Get-FileHash '${base}.zip' -Algorithm SHA256).Hash.ToLower() + '  ${base}.zip'" > "${base}.zip.sha256"
           fi
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target.os }}-${{ matrix.target.arch }}
           path: |
